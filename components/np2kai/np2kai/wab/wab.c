@@ -1,0 +1,1127 @@
+/**
+ * @file	wab.c
+ * @brief	Window Accelerator Board Interface
+ *
+ * @author	$Author: SimK $
+ */
+
+#include <compiler.h>
+
+#if defined(SUPPORT_WAB)
+
+#include "np2.h"
+#if defined(NP2_WIN)
+#include "np2mt.h"
+#include "resource.h"
+#endif
+#include <dosio.h>
+#include <cpucore.h>
+#include <pccore.h>
+#include <io/iocore.h>
+#include <joymng.h>
+#include <mousemng.h>
+#include <scrnmng.h>
+#include <soundmng.h>
+#include <sysmng.h>
+#if defined(NP2_WIN)
+#include "winkbd.h"
+#include "winloc.h"
+#endif
+#include <common/profile.h>
+#include "ini.h"
+#include <vram/dispsync.h>
+#include <wab/wab.h>
+#include <common/bmpdata.h>
+#include <wab/wabbmpsave.h>
+#if defined(NP2_WIN)
+#include	<process.h>
+#endif
+#if defined(SUPPORT_WAB_NPDISP)
+#include "npdisp.h"
+#endif
+#if defined(SUPPORT_CL_GD5430)
+#include "cirrus_vga_extern.h"
+#endif
+#include <wab/wab_rly.h>
+#if defined(NP2_X)
+#include <gtk2/xnp2.h>
+#endif
+
+NP2WAB		np2wab = {0};
+NP2WABWND	np2wabwnd = {0};
+NP2WABCFG	np2wabcfg;
+	
+#if defined(NP2_WIN)
+TCHAR	g_Name[100] = _T("NP2 Window Accelerator");
+#else
+char	g_Name[100] = "NP2 Window Accelerator";
+#endif
+
+#if defined(NP2_WIN)
+static HINSTANCE ga_hInstance = NULL;
+static HANDLE	ga_hThread = NULL;
+#endif
+static int		ga_exitThread = 0;
+#if defined(NP2_WIN)
+static int		ga_threadmode = 1;
+#else
+static int		ga_threadmode = 1;
+#endif
+static int		ga_lastwabwidth = 640;
+static int		ga_lastwabheight = 480;
+static int		ga_reqChangeWindowSize = 0;
+static int		ga_reqChangeWindowSize_w = 0;
+static int		ga_reqChangeWindowSize_h = 0;
+
+static int		ga_lastscalemode = 0;
+static int		ga_lastrealwidth = 0;
+static int		ga_lastrealheight = 0;
+static int		ga_screenupdated = 0;
+
+#if defined(NP2_WIN)
+static int wab_cs_initialized = 0;
+static CRITICAL_SECTION wab_cs;
+static HANDLE wab_thread_eventhandle = INVALID_HANDLE_VALUE;
+#endif
+
+static int np2wab_forceupdateflag = 0;
+
+static RECT np2wab_dirtyrect = { 0 };
+
+void np2wab_setDirtyRect(RECT r)
+{
+	np2wab_dirtyrect = r;
+}
+
+static BOOL wab_tryenter_criticalsection(void){
+#if defined(NP2_WIN)
+	if(!wab_cs_initialized) return TRUE;
+	return TryEnterCriticalSection(&wab_cs);
+#else
+	return TRUE;
+#endif
+}
+static void wab_enter_criticalsection(void){
+#if defined(NP2_WIN)
+	if(!wab_cs_initialized) return;
+	EnterCriticalSection(&wab_cs);
+#endif
+}
+static void wab_leave_criticalsection(void){
+#if defined(NP2_WIN)
+	if(!wab_cs_initialized) return;
+	LeaveCriticalSection(&wab_cs);
+#endif
+}
+static void wab_init_criticalsection(void){
+#if defined(NP2_WIN)
+	if(!wab_cs_initialized){
+		memset(&wab_cs, 0, sizeof(wab_cs));
+		wab_thread_eventhandle = CreateEvent(NULL, FALSE, FALSE, NULL);
+		InitializeCriticalSection(&wab_cs);
+		wab_cs_initialized = 1;
+	}
+#endif
+}
+static void wab_delete_criticalsection(void){
+#if defined(NP2_WIN)
+	if(wab_cs_initialized){
+		DeleteCriticalSection(&wab_cs);
+		CloseHandle(wab_thread_eventhandle);
+		wab_cs_initialized = 0;
+	}
+#endif
+}
+
+/**
+ * 設定
+ */
+#if defined(NP2_WIN)
+static const PFTBL s_wabwndini[] =
+{
+	PFVAL("WindposX", PFTYPE_SINT32,	&np2wabcfg.posx),
+	PFVAL("WindposY", PFTYPE_SINT32,	&np2wabcfg.posy),
+	PFVAL("MULTIWND", PFTYPE_BOOL,		&np2wabcfg.multiwindow),
+	PFVAL("MULTHREAD",PFTYPE_BOOL,		&np2wabcfg.multithread),
+	PFVAL("HALFTONE", PFTYPE_BOOL,		&np2wabcfg.halftone),
+};
+#else
+static const INITBL s_wabwndini[] =
+{
+	{OEMTEXT("WindposX"),  INITYPE_SINT32,	&np2wabcfg.posx,	0},
+	{OEMTEXT("WindposY"),  INITYPE_SINT32,	&np2wabcfg.posy,	0},
+	{OEMTEXT("MULTIWND"),  INITYPE_BOOL,	&np2wabcfg.multiwindow,	0},
+	{OEMTEXT("MULTHREAD"), INITYPE_BOOL,	&np2wabcfg.multithread,	0},
+	{OEMTEXT("HALFTONE"),  INITYPE_BOOL,	&np2wabcfg.halftone,	0},
+};
+#endif
+
+/**
+ * 設定読み込み
+ */
+void wabwin_readini()
+{
+	OEMCHAR szPath[MAX_PATH];
+
+#if defined(NP2_WIN)
+	ZeroMemory(&np2wabcfg, sizeof(np2wabcfg));
+	np2wabcfg.posx = CW_USEDEFAULT;
+	np2wabcfg.posy = CW_USEDEFAULT;
+	np2wabcfg.multithread = 1;
+#else
+	memset(&np2wabcfg, 0, sizeof(np2wabcfg));
+	np2wabcfg.posx = 0;
+	np2wabcfg.posy = 0;
+	np2wabcfg.multithread = 1;
+#endif
+	np2wabcfg.multiwindow = 0;
+	np2wabcfg.halftone = 0;
+
+#if defined(NP2_WIN)
+	initgetfile(szPath, NELEMENTS(szPath));
+#else
+	milstr_ncpy(szPath, modulefile, sizeof(szPath));
+#endif
+	ini_read(szPath, g_Name, s_wabwndini, NELEMENTS(s_wabwndini));
+}
+
+/**
+ * 設定書き込み
+ */
+void np2wab_forceupdate()
+{
+	np2wab_forceupdateflag = 1;
+}
+
+/**
+ * 設定書き込み
+ */
+void wabwin_writeini()
+{
+	if(!np2wabcfg.readonly){
+		TCHAR szPath[MAX_PATH];
+#if defined(NP2_WIN)
+		initgetfile(szPath, NELEMENTS(szPath));
+		ini_write(szPath, g_Name, s_wabwndini, NELEMENTS(s_wabwndini));
+#elif defined(NP2_X)
+		milstr_ncpy(szPath, modulefile, sizeof(szPath));
+		ini_write(szPath, g_Name, s_wabwndini, NELEMENTS(s_wabwndini), FALSE);
+#else
+		milstr_ncpy(szPath, modulefile, sizeof(szPath));
+		ini_write(szPath, g_Name, s_wabwndini, NELEMENTS(s_wabwndini));
+#endif
+	}
+}
+
+void scrnmng_updatefsres(void);
+#ifdef EMSCRIPTEN
+void scrnmng_blthdc(void);
+#endif
+void scrnmng_bltwab(void);
+
+/**
+ * 画面サイズ設定
+ */
+void np2wab_setScreenSize(int width, int height)
+{
+	int bufWidth, bufHeight;
+	if (width < 32 || height < 32) {
+		width = 640;
+		height = 480;
+	}
+	if(np2wabwnd.multiwindow){
+#if defined(NP2_WIN)
+		// 別窓モードなら別窓サイズを更新する
+		RECT rect = { 0, 0, width, height };
+		np2wab.wndWidth = width;
+		np2wab.wndHeight = height;
+		AdjustWindowRectEx( &rect, WS_OVERLAPPEDWINDOW, FALSE, 0 );
+		SetWindowPos( np2wabwnd.hWndWAB, NULL, 0, 0, rect.right-rect.left, rect.bottom-rect.top, SWP_NOMOVE|SWP_NOZORDER );
+#elif defined(NP2_X)
+		np2wab.wndWidth = width;
+		np2wab.wndHeight = height;
+		gtk_widget_set_size_request(np2wabwnd.pWABWnd, width, height);
+#endif
+	}else{
+		// 統合モードならエミュレーション領域サイズを更新する
+		np2wab.wndWidth = ga_lastwabwidth = width;
+		np2wab.wndHeight = ga_lastwabheight = height;
+		if(np2wab.relay & 0x3){
+#if defined(NP2_WIN)
+			scrnmng_setsize(0, 0, width, height);
+#endif
+
+			scrnmng_updatefsres(); // フルスクリーン解像度更新
+#if defined(NP2_WIN)
+			mousemng_updateclip(); // マウスキャプチャのクリップ範囲を修正
+#endif
+		}
+	}
+	// バッファサイズ変更が必要なら変更
+	bufWidth = MAX(width, WAB_RESERVED_WIDTH);
+	bufHeight = MAX(height, WAB_RESERVED_HEIGHT);
+#if defined(_WIN32)
+	if (np2wabwnd.curWidth < bufWidth || np2wabwnd.curHeight < bufHeight) {
+		HDC hdc = np2wabwnd.multiwindow ? GetDC(NULL) : np2wabwnd.hDCWAB;
+		np2wabwnd.curWidth = bufWidth;
+		np2wabwnd.curHeight = bufHeight;
+		SelectObject(np2wabwnd.hDCBuf, np2wabwnd.hBmpOld);
+		DeleteObject(np2wabwnd.hBmpBuf);
+		np2wabwnd.hBmpBuf = CreateCompatibleBitmap(hdc, np2wabwnd.curWidth, np2wabwnd.curHeight);
+		SelectObject(np2wabwnd.hDCBuf, np2wabwnd.hBmpBuf);
+	}
+#endif
+	// とりあえずパレットは更新しておく
+	np2wab.paletteChanged = 1;
+
+	// 画面更新
+	np2wab_forceupdateflag = 1;
+}
+/**
+ * 画面サイズ設定マルチスレッド対応版（すぐに更新できない場合はnp2wab.ready=0に）
+ */
+void np2wab_setScreenSizeMT(int width, int height)
+{
+	if(!ga_threadmode){
+		// マルチスレッドモードでなければ直接呼び出し
+		np2wab_setScreenSize(width, height);
+		ga_lastrealwidth = width;
+		ga_lastrealheight = height;
+	}else{
+		// マルチスレッドモードなら画面サイズ変更要求を出す
+		ga_reqChangeWindowSize_w = width;
+		ga_reqChangeWindowSize_h = height;
+		ga_reqChangeWindowSize = 1;
+		np2wabwnd.ready = 0; // 更新待ち
+	}
+
+	// 画面更新
+	np2wab_forceupdateflag = 1;
+}
+
+/**
+ * ウィンドウアクセラレータ別窓を等倍サイズに戻す
+ */
+void np2wab_resetscreensize()
+{
+	if(np2wabwnd.multiwindow){
+#if defined(NP2_WIN)
+		RECT rect = {0};
+		rect.right = np2wab.wndWidth = np2wab.realWidth;
+		rect.bottom = np2wab.wndHeight = np2wab.realHeight;
+		AdjustWindowRectEx( &rect, WS_OVERLAPPEDWINDOW, FALSE, 0 );
+		SetWindowPos( np2wabwnd.hWndWAB, NULL, 0, 0, rect.right-rect.left, rect.bottom-rect.top, SWP_NOMOVE|SWP_NOZORDER );
+#elif defined(NP2_X)
+		np2wab.wndWidth = np2wab.realWidth;
+		np2wab.wndHeight = np2wab.realHeight;
+		gtk_widget_set_size_request(np2wabwnd.pWABWnd, np2wab.realWidth, np2wab.realHeight);
+#endif
+	}
+
+	// 画面更新
+	np2wab_forceupdateflag = 1;
+}
+
+#if defined(NP2_WIN)
+/**
+ * ウィンドウアクセラレータ別窓WndProc
+ */
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam){
+	RECT		rc;
+	HMENU		hSysMenu;
+	HMENU		hWabMenu;
+	MENUITEMINFO mii = {0};
+	TCHAR szString[128];
+	int scalemode;
+
+	switch (msg) {
+		case WM_CREATE:
+			hSysMenu = GetSystemMenu(hWnd, FALSE);
+			hWabMenu = LoadMenu(ga_hInstance, MAKEINTRESOURCE(IDR_WABSYSMENU));
+			mii.cbSize = sizeof(mii);
+			mii.fMask = MIIM_TYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU | MIIM_DATA;
+			mii.dwTypeData = szString;
+			mii.cch = NELEMENTS(szString);
+			GetMenuItemInfo(hWabMenu, 0, TRUE, &mii);
+			InsertMenuItem(hSysMenu, 0, TRUE, &mii);
+			mii.dwTypeData = szString;
+			mii.cch = NELEMENTS(szString);
+			GetMenuItemInfo(hWabMenu, 1, TRUE, &mii);
+			InsertMenuItem(hSysMenu, 0, TRUE, &mii);
+			CheckMenuItem(hSysMenu, IDM_WABSYSMENU_HALFTONE, MF_BYCOMMAND | (np2wabcfg.halftone ? MF_CHECKED : MF_UNCHECKED));
+			DestroyMenu(hWabMenu);
+
+			break;
+			
+		case WM_SYSCOMMAND:
+			switch(wParam) {
+				case IDM_WABSYSMENU_RESETSIZE:
+					np2wab_resetscreensize();
+					break;
+
+				case IDM_WABSYSMENU_HALFTONE:
+					np2wabcfg.halftone = !np2wabcfg.halftone;
+					hSysMenu = GetSystemMenu(hWnd, FALSE);
+					CheckMenuItem(hSysMenu, IDM_WABSYSMENU_HALFTONE, MF_BYCOMMAND | (np2wabcfg.halftone ? MF_CHECKED : MF_UNCHECKED));
+					scalemode = np2wab.wndWidth!=np2wab.realWidth || np2wab.wndHeight!=np2wab.realHeight;
+					if(scalemode){
+						SetStretchBltMode(np2wabwnd.hDCWAB, np2wabcfg.halftone ? HALFTONE : COLORONCOLOR);
+						SetBrushOrgEx(np2wabwnd.hDCWAB , 0 , 0 , NULL);
+					}
+					break;
+
+				default:
+					return(DefWindowProc(hWnd, msg, wParam, lParam));
+			}
+			break;
+
+		case WM_MOVE:
+			GetWindowRect(hWnd, &rc);
+			if(np2wabwnd.multiwindow && !IsZoomed(hWnd) && !IsIconic(hWnd) && IsWindowVisible(hWnd)){
+				np2wabcfg.posx = rc.left;
+				np2wabcfg.posy = rc.top;
+			}
+			break;
+
+		case WM_ENTERSIZEMOVE:
+			break;
+
+		case WM_MOVING:
+			break;
+			
+		case WM_SIZE:
+			np2wab_forceupdate();
+		case WM_SIZING:
+			GetClientRect( hWnd, &rc );
+			np2wab.wndWidth = rc.right - rc.left;
+			np2wab.wndHeight = rc.bottom - rc.top;
+			break;
+
+		case WM_EXITSIZEMOVE:
+			break;
+
+		case WM_KEYDOWN:
+			SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // 必殺丸投げ
+			break;
+
+		case WM_KEYUP:
+			SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // 必殺丸投げ
+			break;
+
+		case WM_SYSKEYDOWN:
+			SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // 必殺丸投げ
+			break;
+
+		case WM_SYSKEYUP:
+			SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // 必殺丸投げ
+			break;
+
+		case WM_MOUSEMOVE:
+			SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // 必殺丸投げ
+			break;
+
+		case WM_LBUTTONDOWN:
+			if(np2wabwnd.multiwindow){
+				SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // やはり丸投げ
+			}
+			break;
+
+		case WM_LBUTTONUP:
+			if(np2wabwnd.multiwindow){
+				SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // ここも丸投げ
+			}
+			break;
+
+		case WM_RBUTTONDOWN:
+			if(np2wabwnd.multiwindow){
+				SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // そのまま丸投げ
+			}
+			break;
+
+		case WM_RBUTTONUP:
+			if(np2wabwnd.multiwindow){
+				SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // なんでも丸投げ
+			}
+			break;
+
+		case WM_MBUTTONDOWN:
+			SetForegroundWindow(np2wabwnd.hWndMain);
+			SendMessage(np2wabwnd.hWndMain, msg, wParam, lParam); // とりあえず丸投げ
+			break;
+
+		case WM_CLOSE:
+			return 0;
+
+		case WM_DESTROY:
+			break;
+
+		default:
+			return(DefWindowProc(hWnd, msg, wParam, lParam));
+	}
+	return(0L);
+}
+#endif
+
+/**
+ * ウィンドウアクセラレータ画面転送
+ *  別窓モード: GDI Device Independent Bitmap -> GDI Window
+ *  統合モード: GDI Device Independent Bitmap -> Direct3D/DirectDraw WAB surface ( call scrnmng_blthdc() )
+ */
+#if defined(NP2_WIN)
+void np2wab_drawWABWindow(HDC hdc)
+#else
+void np2wab_drawWABWindow(void)
+#endif
+{
+	int scalemode = 0;
+	int srcwidth = np2wab.realWidth;
+	int srcheight = np2wab.realHeight;
+	if(ga_lastrealwidth != srcwidth || ga_lastrealheight != srcheight){
+		// 解像度が変わっていたらウィンドウサイズも変える
+		if(!ga_reqChangeWindowSize){
+			np2wab.paletteChanged = 1;
+			np2wab_setScreenSizeMT(srcwidth, srcheight);
+		}
+		if(!np2wabwnd.ready) return;
+	}
+	if(np2wabwnd.multiwindow){ // 別窓モード判定
+		scalemode = np2wab.wndWidth!=srcwidth || np2wab.wndHeight!=srcheight;
+		if(ga_lastscalemode!=scalemode){ // 画面スケールが変わりました
+			if(scalemode){
+				// 通常はCOLORONCOLOR。HALFTONEにも設定できるけど拡大の補間が微妙･･･
+#if defined(NP2_WIN)
+				SetStretchBltMode(np2wabwnd.hDCWAB, np2wabcfg.halftone ? HALFTONE : COLORONCOLOR);
+				SetBrushOrgEx(np2wabwnd.hDCWAB , 0 , 0 , NULL);
+#endif
+			}else{
+#if defined(NP2_WIN)
+				SetStretchBltMode(np2wabwnd.hDCWAB, BLACKONWHITE);
+#endif
+			}
+			ga_lastscalemode = scalemode;
+			np2wab.paletteChanged = 1;
+		}
+		if(scalemode){
+			// 拡大縮小転送。とりあえず画面比は維持
+			if(np2wab.wndWidth * srcheight > srcwidth * np2wab.wndHeight){
+				// 横長
+				int dstw = srcwidth * np2wab.wndHeight / srcheight;
+				int dsth = np2wab.wndHeight;
+				int mgnw = (np2wab.wndWidth - dstw);
+				int shx = 0;
+				if(mgnw&0x1) shx = 1;
+				mgnw = mgnw>>1;
+#if defined(NP2_WIN)
+				BitBlt(np2wabwnd.hDCWAB, 0, 0, mgnw, np2wab.wndHeight, NULL, 0, 0, BLACKNESS);
+				BitBlt(np2wabwnd.hDCWAB, np2wab.wndWidth-mgnw-shx, 0, mgnw+shx, np2wab.wndHeight, NULL, 0, 0, BLACKNESS);
+				StretchBlt(np2wabwnd.hDCWAB, mgnw, 0, dstw, dsth, np2wabwnd.hDCBuf, 0, 0, srcwidth, srcheight, SRCCOPY);
+#endif
+			}else if(np2wab.wndWidth * srcheight < srcwidth * np2wab.wndHeight){
+				// 縦長
+				int dstw = np2wab.wndWidth;
+				int dsth = srcheight * np2wab.wndWidth / srcwidth;
+				int mgnh = (np2wab.wndHeight - dsth);
+				int shy = 0;
+				if(mgnh&0x1) shy = 1;
+				mgnh = mgnh>>1;
+#if defined(NP2_WIN)
+				BitBlt(np2wabwnd.hDCWAB, 0, 0, np2wab.wndWidth, mgnh, NULL, 0, 0, BLACKNESS);
+				BitBlt(np2wabwnd.hDCWAB, 0, np2wab.wndHeight-mgnh-shy, np2wab.wndWidth, mgnh+shy, NULL, 0, 0, BLACKNESS);
+				StretchBlt(np2wabwnd.hDCWAB, 0, mgnh, dstw, dsth, np2wabwnd.hDCBuf, 0, 0, srcwidth, srcheight, SRCCOPY);
+#endif
+			}else{
+#if defined(NP2_WIN)
+				StretchBlt(np2wabwnd.hDCWAB, 0, 0, np2wab.wndWidth, np2wab.wndHeight, np2wabwnd.hDCBuf, 0, 0, srcwidth, srcheight, SRCCOPY);
+#endif
+			}
+		}else{
+			// 等倍転送
+#if defined(NP2_WIN)
+			BitBlt(np2wabwnd.hDCWAB, 0, 0, srcwidth, srcheight, np2wabwnd.hDCBuf, 0, 0, SRCCOPY);
+#endif
+		}
+	}else{
+		// DirectDrawに描かせる
+		//scrnmng_blthdc(np2wabwnd.hDCBuf);
+		// DirectDraw Surfaceに転送
+#if defined(NP2_WIN)
+		scrnmng_blthdc(np2wabwnd.hDCBuf, np2wab_dirtyrect);
+#else
+		scrnmng_blthdc();
+#endif
+		np2wab_dirtyrect.left = 0;
+		np2wab_dirtyrect.right = 0;
+		np2wab_dirtyrect.top = 0;
+		np2wab_dirtyrect.bottom = 0;
+	}
+}
+
+/**
+ * 同期描画（ga_threadmodeが偽）
+ */
+void np2wab_drawframe()
+{
+#if defined(NP2_WIN)
+	if(!ga_threadmode){
+			NP2WAB_DrawFrame drawFrameFunc = np2wabwnd.drawframe;
+#if defined(SUPPORT_WAB_NPDISP)
+			if (npdisp.active) {
+				drawFrameFunc = npdisp_drawGraphic;
+			}
+#endif
+			if (drawFrameFunc != NULL && drawFrameFunc())
+#endif
+			// マルチスレッドじゃない場合はここで描画処理
+			if (np2wabwnd.drawframe())
+			{
+#if defined(NP2_WIN)
+				np2wab_drawWABWindow(np2wabwnd.hDCBuf);
+#else
+				np2wab_drawWABWindow();
+#endif
+				if (!np2wabwnd.multiwindow)
+				{
+					scrnmng_bltwab();
+					scrnmng_update();
+				}
+			}
+#if defined(NP2_WIN)
+		}
+	}else{
+		if(np2wabwnd.hWndWAB!=NULL){
+			if(ga_reqChangeWindowSize){
+				// 画面サイズ変更要求が来ていたら画面サイズを変える
+				np2wab_setScreenSize(ga_reqChangeWindowSize_w, ga_reqChangeWindowSize_h);
+				ga_lastrealwidth = ga_reqChangeWindowSize_w;
+				ga_lastrealheight = ga_reqChangeWindowSize_h;
+				ga_reqChangeWindowSize = 0;
+				np2wabwnd.ready = 1;
+			}
+			if(np2wabwnd.ready && (np2wab.relay&0x3)!=0){
+				if(ga_screenupdated){
+					wab_enter_criticalsection();
+					if(!np2wabwnd.multiwindow){
+						//np2wab_drawWABWindow(np2wabwnd.hDCBuf); // ga_ThreadFuncでやる
+						scrnmng_bltwab();
+					}
+					ga_screenupdated = 0;
+					if(!np2wabwnd.multiwindow){
+						// XXX: ウィンドウアクセラレータ動作中は内蔵グラフィックを描画しない
+						scrnmng_update();
+					}
+					wab_leave_criticalsection();
+				}
+				SetEvent(wab_thread_eventhandle);
+			}
+		}
+	}
+#endif
+}
+
+#if defined(NP2_WIN)
+/**
+ * 非同期描画（ga_threadmodeが真）
+ */
+unsigned int __stdcall ga_ThreadFunc(LPVOID vdParam) {
+	static int skipcounter = 0;
+	int timeleft = 0;
+	while (WaitForSingleObject(wab_thread_eventhandle, INFINITE) == WAIT_OBJECT_0)
+	{
+		NP2WAB_DrawFrame drawFrameFunc;
+
+		if (ga_exitThread || !ga_threadmode) break;
+
+		wab_enter_criticalsection();
+		if (ga_screenupdated) {
+			wab_leave_criticalsection();
+			continue;
+		}
+		wab_leave_criticalsection();
+
+		drawFrameFunc = np2wabwnd.drawframe;
+#if defined(SUPPORT_WAB_NPDISP)
+		if (npdisp.active) {
+			drawFrameFunc = npdisp_drawGraphic;
+		}
+#endif
+		if(np2wabwnd.ready && np2wabwnd.hWndWAB!=NULL && drawFrameFunc !=NULL && (np2wab.relay&0x3)!=0){
+			if (drawFrameFunc() || np2wab_forceupdateflag)
+			{
+				if (np2wab_forceupdateflag) {
+#if defined(SUPPORT_WAB_NPDISP)
+					if (npdisp.active) {
+						npdisp.paletteUpdated = 1; // パレット強制更新
+						npdisp_setDirtyAll();
+						npdisp.updated = 1; // 強制更新
+					}
+#endif
+#if defined(SUPPORT_CL_GD5430)
+					if (np2clvga.enabled && cirrusvga_opaque) {
+						np2wab.paletteChanged = 1; // パレット含めて強制更新
+					}
+#endif
+				}
+				np2wab_forceupdateflag = 0;
+				np2wab_drawWABWindow(np2wabwnd.hDCBuf);
+				//// 画面転送待ち
+				ga_screenupdated = 1;
+				skipcounter = 0;
+			}
+		}
+	}
+	ga_threadmode = 0;
+	return 0;
+}
+#endif
+
+/**
+ * 画面出力リレー制御
+ */
+static void IOOUTCALL np2wab_ofac(UINT port, REG8 dat) {
+	TRACEOUT(("WAB: out FACh set relay %04X d=%02X", port, dat));
+	dat = dat & ~0xfc;
+	if(np2wab.relaystateext != dat){
+		np2wab.relaystateext = dat & 0x3;
+		np2wab_setRelayState(np2wab.relaystateint|np2wab.relaystateext); // リレーはORで･･･（暫定やっつけ修正）
+	}
+	(void)port;
+	(void)dat;
+}
+static REG8 IOINPCALL np2wab_ifac(UINT port) {
+	//TRACEOUT(("WAB: inp FACh get relay %04X", port));
+	return 0xfc | np2wab.relaystateext;
+}
+
+// NP2起動時の処理
+#if defined(NP2_WIN)
+void np2wab_init(HINSTANCE hInstance, HWND hWndMain)
+#else
+void np2wab_init(void)
+#endif
+{
+#if defined(NP2_WIN)
+	WNDCLASSEX wcex = {0};
+	HDC hdc;
+#endif
+
+	// クリティカルセクション初期化
+	wab_init_criticalsection();
+
+	//// 専用INIセクション読み取り
+	//wabwin_readini();
+	
+#if defined(NP2_WIN)
+	// 後々要る物を保存しておく
+	ga_hInstance = hInstance;
+	np2wabwnd.hWndMain = hWndMain;
+	
+	// ウィンドウアクセラレータ別窓を作る
+	wcex.cbSize = sizeof(WNDCLASSEX);
+    wcex.style = CS_HREDRAW | CS_VREDRAW | (np2wabwnd.multiwindow ? CS_DBLCLKS : 0);
+    wcex.lpfnWndProc = WndProc;
+    wcex.hInstance = ga_hInstance;
+    wcex.hIcon = LoadIcon(ga_hInstance, MAKEINTRESOURCE(IDI_ICON1));
+	wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wcex.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH);
+    wcex.lpszClassName = (TCHAR*)g_Name;
+	if(!RegisterClassEx(&wcex)) return;
+	np2wabwnd.hWndWAB = CreateWindowEx(
+			0, 
+			g_Name, g_Name, 
+			WS_OVERLAPPEDWINDOW,
+			np2wabcfg.posx, np2wabcfg.posy, 
+			640, 480, 
+			np2wabwnd.multiwindow ? NULL : np2wabwnd.hWndMain, 
+			NULL, ga_hInstance, NULL
+		);
+	if(!np2wabwnd.hWndWAB) return;
+
+	// HWNDとかHDCとかバッファ用ビットマップとかを先に作っておく
+	np2wabwnd.hDCWAB = GetDC(np2wabwnd.hWndWAB);
+	hdc = np2wabwnd.multiwindow ? GetDC(NULL) : np2wabwnd.hDCWAB;
+	np2wabwnd.curWidth = WAB_RESERVED_WIDTH;
+	np2wabwnd.curHeight = WAB_RESERVED_HEIGHT;
+	np2wabwnd.hBmpBuf = CreateCompatibleBitmap(hdc, np2wabwnd.curWidth, np2wabwnd.curHeight);
+	np2wabwnd.hDCBuf = CreateCompatibleDC(hdc);
+	np2wabwnd.hBmpOld = SelectObject(np2wabwnd.hDCBuf, np2wabwnd.hBmpBuf);
+#elif defined(NP2_X)
+	np2wabwnd.pPixbuf = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, WAB_MAX_WIDTH, WAB_MAX_HEIGHT);
+#else
+	np2wabwnd.pBuffer = (unsigned int*)malloc(WAB_MAX_WIDTH * WAB_MAX_HEIGHT * sizeof(unsigned int));
+#endif
+
+}
+// リセット時に呼ばれる？
+void np2wab_reset(const NP2CFG *pConfig)
+{
+#if defined(NP2_WIN)
+	// マルチスレッドモードなら先にスレッド処理を終了させる
+	if(ga_threadmode && ga_hThread){
+		ga_exitThread = 1;
+		//while(((int)ResumeThread(ga_hThread))>0);
+		//while(WaitForSingleObject(ga_hThread, 200)==WAIT_TIMEOUT){
+		//	ResumeThread(ga_hThread);
+		//}
+		SetEvent(wab_thread_eventhandle);
+		if(WaitForSingleObject(ga_hThread, 4000)==WAIT_TIMEOUT){
+			TerminateThread(ga_hThread, 0);
+		}
+		CloseHandle(ga_hThread);
+		ga_hThread = NULL;
+		ga_exitThread = 0;
+	}
+#endif
+
+	// 描画を停止して設定初期化
+	np2wabwnd.ready = 0;
+	ga_lastscalemode = 0;
+	ga_lastrealwidth = 0;
+	ga_lastrealheight = 0;
+	ga_screenupdated = 0;
+	np2wab.lastWidth = 0;
+	np2wab.lastHeight = 0;
+	np2wab.realWidth = 0;
+	np2wab.realHeight = 0;
+	np2wab.relaystateint = 0;
+	np2wab.relaystateext = 0;
+	np2wab_setRelayState(np2wab.relaystateint|np2wab.relaystateext);
+
+	if (np2wabwnd.curWidth != WAB_RESERVED_WIDTH && np2wabwnd.curHeight != WAB_RESERVED_HEIGHT) {
+		np2wabwnd.curWidth = WAB_RESERVED_WIDTH;
+		np2wabwnd.curHeight = WAB_RESERVED_HEIGHT;
+#if defined(_WIN32)
+		SelectObject(np2wabwnd.hDCBuf, np2wabwnd.hBmpOld);
+		DeleteObject(np2wabwnd.hBmpBuf);
+		np2wabwnd.hBmpBuf = CreateCompatibleBitmap(np2wabwnd.hDCBuf, np2wabwnd.curWidth, np2wabwnd.curHeight);
+#endif
+        }
+
+	// 設定値更新とか
+	np2wab.wndWidth = 640;
+	np2wab.wndHeight = 480;
+	np2wab.fps = 60;
+	ga_lastwabwidth = 0;
+	ga_lastwabheight = 0;
+	ga_reqChangeWindowSize = 0;
+	
+	// パレットを更新させる
+	np2wab.paletteChanged = 1;
+}
+// リセット時に呼ばれる？（np2net_resetより後・iocore_attach〜が使える）
+void np2wab_bind(void)
+{
+#if defined(NP2_WIN)
+	DWORD dwID;
+
+	// マルチスレッドモードなら先にスレッド処理を終了させる
+	if(ga_threadmode && ga_hThread){
+		ga_exitThread = 1;
+		//while(((int)ResumeThread(ga_hThread))>0);
+		//while(WaitForSingleObject(ga_hThread, 200)==WAIT_TIMEOUT){
+		//	ResumeThread(ga_hThread);
+		//}
+		SetEvent(wab_thread_eventhandle);
+		if(WaitForSingleObject(ga_hThread, 4000)==WAIT_TIMEOUT){
+			TerminateThread(ga_hThread, 0);
+		}
+		CloseHandle(ga_hThread);
+		ga_hThread = NULL;
+		ga_exitThread = 0;
+	}
+#endif
+	
+	// I/Oポートマッピング（FAChは内蔵リレー切り替え）
+	iocore_attachout(0xfac, np2wab_ofac);
+	iocore_attachinp(0xfac, np2wab_ifac);
+	
+	// 設定値更新とか
+	np2wabwnd.multiwindow = np2wabcfg.multiwindow;
+	ga_threadmode = np2wabcfg.multithread;
+	
+	//// 画面消去
+	//BitBlt(np2wabwnd.hDCBuf , 0 , 0 , WAB_MAX_WIDTH , WAB_MAX_HEIGHT , NULL , 0 , 0 , BLACKNESS);
+	//scrnmng_blthdc(np2wabwnd.hDCBuf);
+	
+#if defined(NP2_WIN)
+	// マルチスレッドモードならスレッド開始
+	if(ga_threadmode){
+		ga_hThread  = (HANDLE)_beginthreadex(NULL , 0 , ga_ThreadFunc  , NULL , 0 , &dwID);
+	}
+#endif
+	
+	// パレットを更新させる
+	np2wab.paletteChanged = 1;
+
+	// 描画再開
+	np2wabwnd.ready = 1;
+}
+void np2wab_unbind(void)
+{
+	iocore_detachout(0xfac);
+	iocore_detachinp(0xfac);
+}
+// NP2終了時の処理
+void np2wab_shutdown()
+{
+#if defined(NP2_WIN)
+	// マルチスレッドモードなら先にスレッド処理を終了させる
+	ga_exitThread = 1;
+	//while(((int)ResumeThread(ga_hThread))>0);
+	//if(WaitForSingleObject(ga_hThread, 1000)==WAIT_TIMEOUT){
+	//	ResumeThread(ga_hThread);
+	//}
+	SetEvent(wab_thread_eventhandle);
+	if(WaitForSingleObject(ga_hThread, 4000)==WAIT_TIMEOUT){
+		TerminateThread(ga_hThread, 0); // 諦めて強制終了
+	}
+	CloseHandle(ga_hThread);
+	ga_hThread = NULL;
+
+	// いろいろ解放
+	SelectObject(np2wabwnd.hDCBuf, np2wabwnd.hBmpOld);
+	DeleteDC(np2wabwnd.hDCBuf);
+	DeleteObject(np2wabwnd.hBmpBuf);
+	ReleaseDC(np2wabwnd.hWndWAB, np2wabwnd.hDCWAB);
+	np2wabwnd.hDCWAB = NULL;
+	DestroyWindow(np2wabwnd.hWndWAB);
+	np2wabwnd.hWndWAB = NULL;
+#elif defined(NP2_X)
+	g_object_unref(np2wabwnd.pPixbuf);
+#else
+	free(np2wabwnd.pBuffer);
+#endif
+	
+	// クリティカルセクション破棄
+	wab_delete_criticalsection();
+
+	//// 専用INIセクション書き込み
+	//wabwin_writeini();
+}
+
+// 内蔵ディスプレイ切り替えリレー状態を設定する。stateのbit0は外部ｱｸｾﾗ(=1)/内蔵ｱｸｾﾗ(=0)切替、bit1は内蔵ｱｸｾﾗ(=1)/98ｸﾞﾗﾌ(=0)切替。他は0。
+// 外部・内部の区別をしていないので事実上どちらかのビットが1ならアクセラレータ表示になる
+void np2wab_setRelayState(REG8 state)
+{
+	// bit0,1が変化しているか確認
+	if((np2wab.relay & 0x3) != (state & 0x3)){
+		np2wab.relay = state & 0x3;
+		if(state&0x3){
+			// リレーがON
+#if defined(NP2_WIN)
+			if(!np2cfg.wabasw) soundmng_pcmplay(SOUND_RELAY1, FALSE); // カチッ
+#else
+			if(!np2cfg.wabasw) wabrly_switch(); // カチッ
+#endif
+			if(np2wabwnd.multiwindow){
+				// 別窓モードなら別窓を出す
+#if defined(NP2_WIN)
+				ShowWindow(np2wabwnd.hWndWAB, SW_SHOWNOACTIVATE);
+				SetWindowPos(np2wabwnd.hWndWAB, HWND_TOP, np2wabcfg.posx, np2wabcfg.posy, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW);
+#endif
+			}else{
+				// 統合モードなら画面を乗っ取る
+#if defined(NP2_WIN)
+#if defined(SUPPORT_MULTITHREAD)
+				if(np2_multithread_Enabled()){
+					np2wab_setScreenSizeMT(ga_lastwabwidth, ga_lastwabheight);
+				}else
+#endif
+#endif
+				{
+					np2wab_setScreenSize(ga_lastwabwidth, ga_lastwabheight);
+				}
+			}
+		}else{
+			// リレーがOFF
+#if defined(NP2_WIN)
+			if(!np2cfg.wabasw) soundmng_pcmplay(SOUND_RELAY1, FALSE); // カチッ
+#else
+			if(!np2cfg.wabasw) wabrly_switch(); // カチッ
+#endif
+			if(np2wabwnd.multiwindow){
+				// 別窓モードなら別窓を消す
+				np2wab.lastWidth = 0;
+				np2wab.lastHeight = 0;
+#if defined(NP2_WIN)
+				ShowWindow(np2wabwnd.hWndWAB, SW_HIDE);
+#endif
+			}else{
+				// 統合モードなら画面を戻す
+				np2wab.lastWidth = 0;
+				np2wab.lastHeight = 0;
+#if defined(NP2_WIN)
+				scrnmng_setsize(dsync.scrnxpos, 0, dsync.scrnxmax, dsync.scrnymax);// XXX: 画面サイズを乗っ取る前に戻す
+#else
+				scrnmng_setwidth(dsync.scrnxpos, dsync.scrnxmax); // XXX: 画面幅を乗っ取る前に戻す
+				scrnmng_setheight(0, dsync.scrnymax); // XXX: 画面高さを乗っ取る前に戻す
+#endif
+				scrnmng_updatefsres(); // フルスクリーン解像度更新
+#if defined(NP2_WIN)
+				mousemng_updateclip(); // マウスキャプチャのクリップ範囲を修正
+#endif
+			}
+		}
+	}
+}
+
+/**
+ * ウィンドウアクセラレータ画面をBMPで取得
+ */
+BRESULT np2wab_getbmp(BMPFILE *lpbf, BMPINFO *lpbi, UINT8 **lplppal, UINT8 **lplppixels) {
+
+	BMPDATA		bd;
+	BMPFILE		bf;
+	UINT		pos;
+	BMPINFO		bi;
+	BMPINFO		bitmp;
+	UINT		align;
+	//int			r;
+	//int			x;
+	UINT8		*dstpix;
+#if defined(NP2_WIN)
+	LPVOID      lpbits;
+#else
+	void*       lpbits;
+#endif
+	UINT8       *buf;
+#if defined(NP2_WIN)
+	HBITMAP     hBmpTmp;
+#endif
+	int			bufWidth;
+	int			bufHeight;
+
+	// 24bit固定
+	bd.width = np2wab.wndWidth;
+	bd.height = np2wab.wndHeight;
+	bd.bpp = 24;
+
+	// Bitmap File
+	ZeroMemory(&bf, sizeof(bf));
+	bf.bfType[0] = 'B';
+	bf.bfType[1] = 'M';
+	pos = sizeof(BMPFILE) + sizeof(BMPINFO);
+	STOREINTELDWORD(bf.bfOffBits, pos);
+
+	// Bitmap Info
+	bmpdata_setinfo(&bi, &bd);
+	STOREINTELDWORD(bi.biClrImportant, 0);
+	align = bmpdata_getalign(&bi);
+	CopyMemory(lpbi, &bi, sizeof(bi));
+	*lplppal = (UINT8*)malloc(0); // freeで解放されても大丈夫なように（大抵NULLが入る）
+	
+	// Bitmap File (size)
+	STOREINTELDWORD(bf.bfSize, (sizeof(BMPFILE) + sizeof(BMPINFO) + 0 + bmpdata_getalign(&bi) * bd.height));
+	CopyMemory(lpbf, &bf, sizeof(bf));
+
+	*lplppixels = (UINT8*)malloc(bmpdata_getalign(&bi) * bd.height);
+	dstpix = *lplppixels;
+
+	// Copy Pixels
+	bitmp = bi;
+	bufWidth = np2wabwnd.curWidth;
+	bufHeight = np2wabwnd.curHeight;
+	STOREINTELDWORD(bitmp.biWidth, bufWidth);
+	STOREINTELDWORD(bitmp.biHeight, bufHeight);
+#if defined(NP2_WIN)
+	hBmpTmp = CreateDIBSection(NULL, (LPBITMAPINFO)&bitmp, DIB_RGB_COLORS, &lpbits, NULL, 0);
+	GetDIBits(np2wabwnd.hDCBuf, np2wabwnd.hBmpBuf, 0, bufHeight, lpbits, (LPBITMAPINFO)&bitmp, DIB_RGB_COLORS);
+#elif defined(NP2_X)
+	buf = (UINT8*)(gdk_pixbuf_get_pixels(np2wabwnd.pPixbuf)) + (np2wab.wndHeight - 1) * WAB_MAX_WIDTH*bd.bpp/8;
+#else
+	buf = (UINT8*)(lpbits) + (bufHeight - bd.height) * bufWidth * bd.bpp/8;
+#endif
+	do {
+#if defined(NP2_WIN)
+		CopyMemory(dstpix, buf, np2wab.wndWidth*bd.bpp/8);
+		dstpix += align;
+		buf += bufWidth * bd.bpp/8;
+#elif defined(NP2_X)
+		CopyMemory(dstpix, buf, np2wab.wndWidth*bd.bpp/8);
+		dstpix += align;
+		buf -= bufWidth * bd.bpp/8;
+#else
+		int i;
+		for(i = 0; i < np2wab.wndWidth; i++) {
+			((UINT8*)dstpix)[i * 3    ] = ((UINT8*)buf)[i * 4    ];
+			((UINT8*)dstpix)[i * 3 + 1] = ((UINT8*)buf)[i * 4 + 1];
+			((UINT8*)dstpix)[i * 3 + 2] = ((UINT8*)buf)[i * 4 + 2];
+		}
+		dstpix += np2wab.wndWidth*3;
+		buf -= np2wab.wndWidth*4;
+#endif
+	} while(--bd.height);
+#if defined(NP2_WIN)
+	DeleteObject(hBmpTmp);
+#elif defined(NP2_X)
+	{
+		int i, j;
+		UINT8 tmp;
+		dstpix = *lplppixels;
+		for(j = 0; j < np2wab.wndHeight; j++) {
+			for(i = 0; i < np2wab.wndWidth; i++) {
+				tmp = dstpix[(j * np2wab.wndWidth + i) * 3];
+				dstpix[(j * np2wab.wndWidth + i) * 3] = dstpix[(j * np2wab.wndWidth + i) * 3 + 2];
+				dstpix[(j * np2wab.wndWidth + i) * 3 + 2] = tmp;
+			}
+		}
+	}
+#endif
+
+	return(SUCCESS);
+}
+
+/**
+ * ウィンドウアクセラレータ画面をBMPで保存
+ */
+BRESULT np2wab_writebmp(const OEMCHAR *filename) {
+	
+	FILEH		fh;
+	BMPFILE     bf;
+	BMPINFO     bi;
+	UINT8       *lppal;
+	UINT8       *lppixels;
+	int	        pixelssize;
+	
+	fh = file_create(filename);
+	if (fh == FILEH_INVALID) {
+		goto sswb_err1;
+	}
+	
+	np2wab_getbmp(&bf, &bi, &lppal, &lppixels);
+	
+	// Bitmap File
+	if (file_write(fh, &bf, sizeof(bf)) != sizeof(bf)) {
+		goto sswb_err3;
+	}
+
+	// Bitmap Info (パレット不要)
+	if (file_write(fh, &bi, sizeof(bi)) != sizeof(bi)) {
+		goto sswb_err3;
+	}
+	
+	// Pixels
+	pixelssize = bmpdata_getalign(&bi) * LOADINTELDWORD(bi.biHeight);
+	if (file_write(fh, lppixels, pixelssize) != pixelssize) {
+		goto sswb_err3;
+	}
+
+	_MFREE(lppal);
+	_MFREE(lppixels);
+
+	file_close(fh);
+
+	return(SUCCESS);
+	
+sswb_err3:
+	_MFREE(lppal);
+	_MFREE(lppixels);
+
+//sswb_err2:
+//	file_close(fh);
+//	file_delete(filename);
+
+sswb_err1:
+	return(FAILURE);
+}
+
+#endif	/* SUPPORT_WAB */

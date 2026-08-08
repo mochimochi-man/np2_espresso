@@ -1,0 +1,36 @@
+# Route the whole np2kai core's static .bss/.common into external RAM (PSRAM).
+# Requires CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y.
+# This is what makes the ~6MB of core static data fit — no per-array pointer surgery.
+
+[scheme:np2kai_extram]
+entries:
+    bss -> extern_ram
+    common -> extern_ram
+
+# Interpreter TEXT in IRAM: the hot V30 exec loop is ~63KB — bigger than the 32KB
+# instruction cache, so running from flash XIP thrashes. IRAM has no fetch wait.
+[scheme:np2kai_iram]
+entries:
+    text -> iram0_text
+
+[mapping:np2kai]
+archive: libnp2kai.a
+entries:
+    # Keep only the small, very hot register file + access tables (i386core /
+    # reg*_b* in ia32.c, ~7KB) in fast internal DRAM. NOTE: moving the 64KB SZP
+    # flag table (cpucore.c szpflag_w) to internal measured no speedup but cost
+    # 64KB of internal SRAM — that budget is far better spent on the 32KB
+    # instruction cache (which *did* help a lot), so cpucore stays in PSRAM.
+    ia32 (default)
+    i286c (np2kai_iram)
+    i286c_mn (np2kai_iram)
+    i286c_8x (np2kai_iram)
+    i286c_f6 (np2kai_iram)
+    i286c_fe (np2kai_iram)
+    i286c_0f (np2kai_iram)
+    i286c_rp (np2kai_iram)
+    i286c_sf (np2kai_iram)
+    i286c_ea (np2kai_iram)
+    v30patch (np2kai_iram)
+    cpumem (np2kai_iram)
+    * (np2kai_extram)

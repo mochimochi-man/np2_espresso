@@ -1,0 +1,29 @@
+# ESP-IDF build output
+build/
+build_*/
+managed_components/
+sdkconfig
+sdkconfig.old
+*.bin
+*.elf
+*.map
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python
+__pycache__/
+*.pyc
+
+# AI
+.claude/
+.gemini/
+.codex/
+AI.md
+CLAUDE.md
+GEMINI.md
+AGENTS.md
