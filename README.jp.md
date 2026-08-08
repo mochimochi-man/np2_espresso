@@ -107,7 +107,7 @@ Copyright (c) 2026 Mochimochi-Man / Uh (X:@calorie0)
 
 This license applies to the np2_espresso ESP32-S3 porting code authored for this
 project (primarily the files under main/ and the ESP-IDF build glue). Bundled
-third-party components retain their own licenses; see NOTICE.md and the LICENSES/
+third-party components retain their own licenses; see NOTICE.jp.md and the LICENSES/
 folders within each component.
 
 Redistribution and use in source and binary forms, with or without
@@ -136,4 +136,4 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-関連ライセンスは、別添 [NOTICE.md](NOTICE.md) をご覧ください。
+関連ライセンスは、別添 [NOTICE.jp.md](NOTICE.jp.md) をご覧ください。
