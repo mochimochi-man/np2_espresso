@@ -1,29 +1,32 @@
 # PC-9801 emulator np2 espresso
-Copyright (c) 2026 もちもちまん / うっ (X:@calorie0)
+Copyright (c) 2026 Mochimochi-Man / Uh (X:@calorie0)
 
-本プロジェクトは、ESP32-S3 または同等以上の性能を有する ESP32 シリーズ上において、往年のレトロパソコン PC-9801 シリーズをエミュレートするエミュレーターです。
+This project is an emulator that runs the classic retro PC 'PC-9801 series' on the
+ESP32-S3 (or any ESP32 of equal or greater performance).
 
-AZO234 氏が開発された [np2kai](https://github.com/AZO234/NP2kai) をベースに、ESP32 で動作するよう修正とカスタマイズを加えました。
+It is based on [np2kai](https://github.com/AZO234/NP2kai) by AZO234, with
+modifications and customizations to run on the ESP32.
 
-## 必要なハードウェア
+## Required hardware
 
 - ESP32-S3 N16R8 Devkit
-- LCD ST7789 TFT 240x320 モジュール
-- DAC MAX98357A I2S モジュール
-- microSD カードリーダー SPI モジュール
-- microSD カード 32GB 以下 ※FAT32 でフォーマット
-- パッシブスピーカー 2W 8ohm 程度 ※MAX98357A に接続
-- USB 有線キーボード
-- USB 有線マウス
-- USB セルフパワーハブ ※AC アダプタから給電できるもの
+- LCD ST7789 TFT 240x320 module
+- DAC MAX98357A I2S module
+- microSD card reader (SPI) module
+- microSD card, 32GB or less, formatted as FAT32
+- Passive speaker, around 2W 8ohm (connected to the MAX98357A)
+- USB wired keyboard
+- USB wired mouse
+- USB self-powered hub (one that can be powered from an AC adapter)
 
-## 必要なソフトウェア
+## Required software
 
-- ESP-IDF v5.5 系
-- PC-9801 系実機から抽出した `BIOS.ROM` / `SOUND.ROM` / `FONT.ROM` ※microSD カードのルートに入れてください。
-- `.NFD` や `.NHD` などのディスクイメージ ※microSD カードのルートに入れてください。
+- ESP-IDF v5.5 series
+- `BIOS.ROM` / `SOUND.ROM` / `FONT.ROM` extracted from real PC-9801 hardware.
+  Place them in the root of the microSD card.
+- Disk images such as `.NFD` or `.NHD`. Place them in the root of the microSD card.
 
-## 配線
+## Wiring
 
 ### LCD ST7789 TFT 240x320 Module
 
@@ -49,7 +52,7 @@ AZO234 氏が開発された [np2kai](https://github.com/AZO234/NP2kai) をベ�
 | VCC | 5V |
 | GND | GND |
 
-※ +/- 端子に 2W 8ohm 程度のスピーカーを接続してください。(+RED, -BLACK)
+Connect a speaker of about 2W 8ohm to the +/- terminals. (+RED, -BLACK)
 
 ### microSD CardReader SPI
 
@@ -62,43 +65,47 @@ AZO234 氏が開発された [np2kai](https://github.com/AZO234/NP2kai) をベ�
 | VCC | 3.3V |
 | GND | GND |
 
-## ビルド方法
+## Build
 
-ビルド:
+Build:
 
 ```sh
 ./build.sh
 ```
 
-または ESP-IDF を有効化してから `idf.py` を実行:
+Or activate ESP-IDF first, then run `idf.py`:
 
 ```sh
 . $IDF_PATH/export.sh
 idf.py build
 ```
 
-`build/np2_espresso.bin` ができるので、書き込み＋モニタ:
+This produces `build/np2_espresso.bin`. Flash and monitor:
 
 ```sh
 ./flash.sh [PORT]
 ```
 
-モニタ終了は `Ctrl-]`。
+Exit the monitor with `Ctrl-]`.
 
-## 実行
+## Running
 
-1. microSD カードリーダーに、所定のディスクイメージを入れた microSD カードを挿入します。
-2. ESP32-S3 の USB-OTG 側 USB 端子にセルフパワーハブを接続し、ハブに USB 有線キーボードと USB 有線マウスを接続してください。
-3. ESP32-S3 の Serial 側 USB 端子に電源を接続してください。数秒後に「ピポ」と音が鳴ってメモリカウントが始まれば成功です。
+1. Insert a microSD card (with the required disk images) into the card reader.
+2. Connect the self-powered hub to the ESP32-S3's USB-OTG port, then connect the
+   USB wired keyboard and USB wired mouse to the hub.
+3. Connect power to the ESP32-S3's Serial USB port. If you hear the "pipo" chime
+   after a few seconds and the memory count begins, it is working.
 
-## 操作方法
+## Controls
 
-- **Pause/Break** キーを押すとメニューを表示します。
-- FDD1/FDD2/HDD のディスクマウント、CPU の優先度、縮小表示のアルゴリズム切替を行うことができます。
-- CPU の優先度を上げるとグラフィックスの描画優先度が下がります。グラフィックスの描画に支障がある場合は、CPU の優先度を下げてみてください。
-- **ESC** キーを押す、または **RESET** を選択すると、現在の状態を保存してメニューから抜けます。
+- Press **Pause/Break** to open the menu.
+- From the menu you can mount FDD1/FDD2/HDD disk images, change the CPU priority,
+  and switch the downscaling algorithm.
+- Raising the CPU priority lowers the graphics-rendering priority. If graphics
+  rendering is affected, try lowering the CPU priority.
+- Press **ESC**, or select **RESET**, to save the current state and leave the menu.
 
-## ライセンス
+## License
 
 ```
 BSD 3-Clause License
@@ -136,4 +143,4 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-関連ライセンスは、別添 [NOTICE.md](NOTICE.md) をご覧ください。
+For related third-party licenses, see the accompanying [NOTICE.en.md](NOTICE.en.md).
