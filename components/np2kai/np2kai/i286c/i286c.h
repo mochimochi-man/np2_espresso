@@ -152,10 +152,27 @@ extern I286EXT i286c_repe_scasw(void);
 extern I286EXT i286c_repne_scasw(void);
 
 
-#define i286_memoryread(a)			memp_read8(a)
-#define i286_memoryread_w(a)		memp_read16(a)
+// Fast path inlined: opcode fetch + byte operands are almost always in main RAM
+// (addr < I286_MEMREADMAX), so avoid the cross-TU call to memp_read8 for the
+// common case and read mem[] directly. Faithful to memp_read8's own fast path
+// (same unmasked compare); high addresses (VRAM/BIOS/etc.) fall back to it.
+// The argument is evaluated exactly once (statement-expression), matching the
+// original function-call semantics.
+#define i286_memoryread(a)			(__extension__({ const UINT32 i286rd_a_ = (UINT32)(a); \
+		(REG8)(i286rd_a_ < (UINT32)(I286_MEMREADMAX) ? mem[i286rd_a_] : memp_read8(i286rd_a_)); }))
+// Fast path inlined (mirrors memp_read16): word fetch/operand in main RAM below
+// the 32KB-boundary limit reads directly via LOADINTELWORD; everything else
+// (page-boundary spanning, VRAM/BIOS) falls back to memp_read16. Arg eval'd once.
+#define i286_memoryread_w(a)		(__extension__({ const UINT32 i286rw_a_ = (UINT32)(a); \
+		(REG16)(i286rw_a_ < (UINT32)(I286_MEMREADMAX - 1) ? LOADINTELWORD(mem + i286rw_a_) : memp_read16(i286rw_a_)); }))
 #define i286_memoryread_d(a)		memp_read32(a)
-#define i286_memorywrite(a, v)		memp_write8(a, v)
-#define i286_memorywrite_w(a, v)	memp_write16(a, v)
+// Fast path inlined (mirrors memp_write8/16): stores into main RAM below the
+// write limit go straight to mem[]; VRAM/text (>= I286_MEMWRITEMAX) and word
+// stores spanning a 32KB boundary fall back to the slow path (which keeps the
+// dirty-tracking / IO side effects). Both args are evaluated exactly once.
+#define i286_memorywrite(a, v)		(__extension__({ const UINT32 i286wa_ = (UINT32)(a); const REG8 i286wv_ = (REG8)(v); \
+		if (i286wa_ < (UINT32)(I286_MEMWRITEMAX)) { mem[i286wa_] = (UINT8)i286wv_; } else { memp_write8(i286wa_, i286wv_); } }))
+#define i286_memorywrite_w(a, v)	(__extension__({ const UINT32 i286wa_ = (UINT32)(a); const REG16 i286wv_ = (REG16)(v); \
+		if (i286wa_ < (UINT32)(I286_MEMWRITEMAX - 1)) { STOREINTELWORD(mem + i286wa_, i286wv_); } else { memp_write16(i286wa_, i286wv_); } }))
 #define i286_memorywrite_d(a, v)	memp_write32(a, v)
 

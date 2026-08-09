@@ -1,1 +1,2 @@
 build 20260808 first release.
+build 20260809 optimazed and included binary in package.

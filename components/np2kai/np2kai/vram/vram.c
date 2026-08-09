@@ -5,7 +5,8 @@
 
 	_VRAMOP	vramop;
 	UINT8	tramupdate[0x1000];
-	UINT8	vramupdate[0x8000];
+	// 16-byte aligned so the PIE clear (makegrph.c) can use EE.VLD/VST.128.
+	UINT8	vramupdate[0x8000] __attribute__((aligned(16)));
 #if defined(SUPPORT_PC9821)
 #if defined(SUPPORT_IA32_HAXM)
 	UINT8	vramex_base[0x80000]; // PEGC VRAM

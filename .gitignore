@@ -8,6 +8,9 @@ sdkconfig.old
 *.elf
 *.map
 
+# ...but DO ship the prebuilt release firmware in dist_bin/
+!dist_bin/*.bin
+
 # Editor / OS
 .vscode/
 .idea/

@@ -12,8 +12,10 @@
 
 #include <Arduino.h>
 #include <math.h>
+#include <string.h>
 #include "driver/i2s.h"                 // legacy driver (matches Anemoia)
 #include "freertos/stream_buffer.h"
+#include "pie_simd.h"                   // ESP32-S3 PIE SIMD helpers (np2kai shim)
 
 extern "C" int ets_printf(const char *fmt, ...);
 
@@ -29,6 +31,10 @@ static int16_t            *s_buf  = nullptr;   // conversion scratch (stereo int
 static int                 s_bufframes = 0;
 static StreamBufferHandle_t s_ring = nullptr;  // core1 -> core0 PCM stream (bytes)
 static int                 s_rate = 22050;
+#if NP2_SIMD_SELFCHECK
+static int16_t            *s_ref  = nullptr;   // C-reference scratch for the PIE dual-run check
+static int                 s_checks = 0, s_fails = 0, s_pie_calls = 0;
+#endif
 
 volatile int g_audio_peak  = 0;   // max |sample| pre-clip (>32767 = clipping)
 volatile int g_audio_drops = 0;   // stereo frames the ring couldn't accept (overflow)
@@ -83,11 +89,24 @@ extern "C" bool audio_init(int rate, int maxframes) {
         ets_printf("audio: i2s_set_pin FAIL\n"); return false;
     }
     s_bufframes = maxframes;
-    s_buf = (int16_t *)heap_caps_malloc((size_t)maxframes * 2 * sizeof(int16_t),
-                                        MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    // 16-byte align the scratch: the PIE fast path requires it (EE.VST.128).
+    // Never freed (lives for the whole session), so the raw pointer is dropped.
+    size_t scratch = (size_t)maxframes * 2 * sizeof(int16_t) + 16;
+    void *raw_buf = heap_caps_malloc(scratch, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    if (!raw_buf) { ets_printf("audio: alloc FAIL\n"); return false; }
+    s_buf = (int16_t *)(((uintptr_t)raw_buf + 15) & ~(uintptr_t)15);
+#if NP2_SIMD_SELFCHECK
+    void *raw_ref = heap_caps_malloc(scratch, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    if (!raw_ref) { ets_printf("audio: alloc FAIL\n"); return false; }
+    s_ref = (int16_t *)(((uintptr_t)raw_ref + 15) & ~(uintptr_t)15);
+#endif
     size_t ringbytes = (size_t)maxframes * 2 * sizeof(int16_t) * 6;   // ~120ms: absorb load jitter
     s_ring = xStreamBufferCreate(ringbytes, 1);
+#if NP2_SIMD_SELFCHECK
+    if (!s_buf || !s_ring || !s_ref) { ets_printf("audio: alloc FAIL\n"); return false; }
+#else
     if (!s_buf || !s_ring) { ets_printf("audio: alloc FAIL\n"); return false; }
+#endif
     s_ok = true;
     xTaskCreatePinnedToCore(audio_task, "audio", 3072, nullptr, 6, nullptr, 0);
     ets_printf("audio: I2S(legacy) ready rate=%d pins bclk=%d ws=%d dout=%d\n",
@@ -95,25 +114,40 @@ extern "C" bool audio_init(int rate, int maxframes) {
     return true;
 }
 
-static inline int16_t clip16(int32_t v) {
-    if (v >  32767) return  32767;
-    if (v < -32768) return -32768;
-    return (int16_t)v;
-}
-
 // Convert `frames` interleaved stereo SINT32 -> int16 and enqueue for core 0.
 extern "C" void audio_write_s32(const int32_t *pcm, int frames) {
     if (!s_ok || !s_ring || !s_buf || !pcm || frames <= 0) return;
     if (frames > s_bufframes) frames = s_bufframes;
-    int peak = g_audio_peak;
-    for (int i = 0; i < frames * 2; i++) {
-        int32_t v = pcm[i];
-        int32_t av = v < 0 ? -v : v;
-        if (av > peak) peak = av;
-        s_buf[i] = clip16(v);
+    const int n = frames * 2;
+    size_t bytes = (size_t)n * sizeof(int16_t);
+#if NP2_SIMD_SELFCHECK
+    // Dual-run: C reference vs PIE dispatcher on the same input, byte-compare.
+    // Also reports alignment, since the PIE path only engages on 16B-aligned
+    // src/dst (s_buf is aligned; sndstream.buffer comes from the core's _MALLOC).
+    uint32_t t0 = esp_cpu_get_cycle_count();
+    int peak_ref = np2simd_s32_to_s16_c(pcm, s_ref, n, g_audio_peak);
+    uint32_t t1 = esp_cpu_get_cycle_count();
+    int peak_pie = np2simd_s32_to_s16(pcm, s_buf, n, g_audio_peak);
+    uint32_t t2 = esp_cpu_get_cycle_count();
+    const bool pie_used = (n >= 8 && np2simd_aligned16(pcm) && np2simd_aligned16(s_buf));
+    s_checks++; s_pie_calls += pie_used ? 1 : 0;
+    bool fail = (peak_ref != peak_pie) || memcmp(s_ref, s_buf, bytes) != 0;
+    if (fail) {
+        s_fails++;
+        ets_printf("SELFCHECK audio FAIL #%d peak ref=%d pie=%d n=%d\n",
+                   s_fails, peak_ref, peak_pie, n);
+        for (int i = 0; i < n; i++)
+            if (s_ref[i] != s_buf[i])
+                ets_printf("  first diff i=%d ref=%d pie=%d\n", i, s_ref[i], s_buf[i]), i = n;
     }
-    g_audio_peak = peak;
-    size_t bytes = (size_t)frames * 2 * sizeof(int16_t);
+    if (fail || (s_checks & 0x3F) == 1)
+        ets_printf("SELFCHECK audio: %s C=%lu PIE=%lu cyc fails=%d/%d pie_calls=%d src_al=%d dst_al=%d\n",
+                   fail ? "FAIL" : "PASS", (unsigned long)(t1 - t0), (unsigned long)(t2 - t1),
+                   s_fails, s_checks, s_pie_calls, (int)(((uintptr_t)pcm) & 15), (int)(((uintptr_t)s_buf) & 15));
+    g_audio_peak = peak_pie;
+#else
+    g_audio_peak = np2simd_s32_to_s16(pcm, s_buf, n, g_audio_peak);
+#endif
     size_t sent  = xStreamBufferSend(s_ring, s_buf, bytes, 0);
     if (sent < bytes) g_audio_drops += (int)((bytes - sent) / (2 * sizeof(int16_t)));
 }

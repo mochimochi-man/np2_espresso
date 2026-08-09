@@ -40,6 +40,9 @@ typedef struct {
 
 static	SNDSTREAM	sndstream;
 
+// ESP32-S3 PIE: raw allocation behind sndstream.buffer (16B-aligned view).
+static	void		*sndstream_raw = NULL;
+
 // ESP32 diag: generated/skipped samples + pcmlock count (read by main.cpp)
 volatile int g_np2_snd_gen = 0;
 volatile int g_np2_snd_skip = 0;
@@ -249,11 +252,14 @@ BRESULT sound_create(UINT rate, UINT ms) {
 #else
 	reserve = 0;
 #endif
-	sndstream.buffer = (SINT32 *)_MALLOC((samples + reserve) * 2 
-												* sizeof(SINT32), "stream");
-	if (sndstream.buffer == NULL) {
+	// ESP32-S3 PIE: keep the stream buffer 16-byte aligned so the SIMD
+	// s32->s16 converter (pie_simd.h) can use EE.VLD.128 on it. The raw
+	// allocation pointer is kept for _MFREE.
+	sndstream_raw = _MALLOC((samples + reserve) * 2 * sizeof(SINT32) + 16, "stream");
+	if (sndstream_raw == NULL) {
 		goto scre_err2;
 	}
+	sndstream.buffer = (SINT32 *)(((UINT32)(size_t)sndstream_raw + 15) & ~(UINT32)15);
 	sndstream.samples = samples;
 	sndstream.reserve = reserve;
 
@@ -278,7 +284,8 @@ void sound_destroy(void) {
 		streamreset();
 		soundmng_destroy();
 		SNDCSEC_TERM;
-		_MFREE(sndstream.buffer);
+		_MFREE(sndstream_raw);
+		sndstream_raw = NULL;
 		sndstream.buffer = NULL;
 	}
 }

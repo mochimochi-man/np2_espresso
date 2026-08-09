@@ -1,0 +1,19 @@
+np2_espresso - prebuilt firmware (final distribution build)
+============================================================
+
+Target: ESP32-S3 (N16R8 / 16MB flash / 8MB Octal PSRAM)
+Build : build 20260808 (interpreter memory-access fast-path, ~24% faster CPU loop)
+
+Flash with esptool (replace PORT, e.g. COM21 or /dev/ttyACM0):
+
+  esptool --chip esp32s3 -p PORT -b 460800 --before default_reset --after hard_reset \
+    write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \
+    0x0     bootloader.bin \
+    0x8000  partition-table.bin \
+    0xe000  ota_data_initial.bin \
+    0x10000 np2_espresso.bin
+
+Before running, put BIOS.ROM / SOUND.ROM / FONT.ROM and your .NHD/.NFD disk
+images on the microSD card root (see ../README.md / ../README.en.md).
+
+To rebuild from source instead, use ../build.sh (requires ESP-IDF v5.5).

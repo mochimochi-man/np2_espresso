@@ -8,6 +8,17 @@
 #include	<vram/makegrph.h>
 #include	"makegrph.mcr"
 #include	"maketext.h"
+#include	"pie_simd.h"		// ESP32-S3 PIE SIMD helpers (np2kai shim)
+
+
+// Clear one plane's dirty bits across the whole vramupdate map (32KB).
+// Measured on-device (SELFCHECK andmask): the PIE RMW kernel is ~1.4x SLOWER
+// than the scalar UINT32 loop on PSRAM (read-after-write on the same cache
+// lines), so this stays on the C reference path — the PIE kernel remains in
+// pie_simd.h for internal-RAM uses.
+static void makegrph_clear_update(UINT32 keep) {
+	np2simd_andmask_c(vramupdate, keep, 0x8000);
+}
 
 
 typedef struct {
@@ -402,9 +413,7 @@ void VRAMCALL makegrph(int page, int alldraw) {
 				}
 			}
 		}
-		for (i=0; i<0x8000; i+=4) {
-			*(UINT32 *)(vramupdate + i) &= ~0x01010101;
-		}
+		makegrph_clear_update(~0x01010101u);
 	}
 	else {
 		mg.vm = (UINT32 *)(np2_vram[1] + dsync.grphvad);
@@ -446,9 +455,7 @@ void VRAMCALL makegrph(int page, int alldraw) {
 				}
 			}
 		}
-		for (i=0; i<0x8000; i+=4) {
-			*(UINT32 *)(vramupdate + i) &= ~0x02020202;
-		}
+		makegrph_clear_update(~0x02020202u);
 	}
 }
 
