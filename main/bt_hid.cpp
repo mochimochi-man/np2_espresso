@@ -833,6 +833,14 @@ static void bt_worker(void *arg) {
             bt_sleep_ms(2000);
             continue;
         }
+        // Nothing has paired at all and the grace period is over. Almost always
+        // a USB-only setup (or no keyboard nearby yet): back off to the same
+        // slow retry, because otherwise this scans at ~86% duty forever on a
+        // machine that will never use Bluetooth, and the radio is not free -
+        // it shares the die with the panel's scanout and the SD card.
+        if (dev_count() == 0 && !grace) {
+            bt_sleep_ms(SCAN_RETRY_PAUSE_S * 1000);
+        }
         if (kbd_in && !grace) {
             // Grace expired with a keyboard in but no mouse. Do NOT give up for
             // good: a mouse switched on later could then never be found, which
@@ -849,7 +857,7 @@ static void bt_worker(void *arg) {
         // Something attached already: short windows, so the radio stays mostly
         // quiet next to the panel and the SD card.
         const bool nothing_attached = (dev_count() == 0);
-        uint32_t window = (first_pass || nothing_attached) ? SCAN_WINDOW_BOOT_S
+        uint32_t window = (first_pass || (nothing_attached && grace)) ? SCAN_WINDOW_BOOT_S
                                                           : SCAN_WINDOW_IDLE_S;
         first_pass = false;
 

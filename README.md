@@ -113,6 +113,15 @@ search ends, to keep it away from the display and the microSD card. While only o
 of them is connected the search continues, so a device switched on later still
 gets in.
 
+### If you do not use Bluetooth
+
+Nothing to do. The search runs for about two minutes after power-on and then goes
+nearly idle, checking briefly once a minute - so a Bluetooth device switched on
+later still connects, and a USB-only setup is not affected.
+
+Using Bluetooth for only the keyboard or only the mouse is fine too; plug the other
+one in over USB.
+
 ### Limitations
 
 - **Bluetooth LE (BLE / HOGP) devices only.** The ESP32-S3 has no Bluetooth Classic
