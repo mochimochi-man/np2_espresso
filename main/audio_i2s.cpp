@@ -72,7 +72,13 @@ extern "C" bool audio_init(int rate, int maxframes) {
     cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;   // stereo
     cfg.communication_format = I2S_COMM_FORMAT_I2S_MSB;      // == Anemoia
     cfg.intr_alloc_flags     = 0;
-    cfg.dma_buf_count        = 8;
+    // 4 x 256 stereo frames = 4KB of internal DMA RAM (8 buffers wanted 8KB).
+    // Internal DMA memory is shared with the BLE controller, which takes ~44KB
+    // at boot, and with the SD driver's per-transfer buffers; at 8 buffers
+    // i2s_driver_install() started failing ("Error malloc dma buffer" -> no
+    // sound at all). 1024 frames still buffers 46ms at 22050Hz, comfortably
+    // more than FM_DELAY_MS (20ms).
+    cfg.dma_buf_count        = 4;
     cfg.dma_buf_len          = 256;
     cfg.use_apll             = false;
     cfg.tx_desc_auto_clear   = true;

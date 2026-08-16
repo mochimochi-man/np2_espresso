@@ -6,7 +6,13 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
-CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+# Only allocations below this go to internal RAM by default. Lowered from 16384
+# for Bluetooth: the BLE controller needs a large contiguous internal block, and
+# every mid-sized malloc that lands internally fragments what is left.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# Internal RAM held back for internal/DMA-only allocations (the BLE controller
+# is the big customer, at ~44KB contiguous).
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=98304
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=n
 
 # --- Flash / partitions ---
@@ -17,8 +23,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # --- Arduino as component needs 1kHz tick ---
 CONFIG_FREERTOS_HZ=1000
 
-# --- app main task: give the emulator a big stack ---
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
+# --- app main task ---
+# The emulator runs on its own task with a 56KB static stack (emu_stack in
+# main.cpp), so app_main only needs room for the BLE bring-up and initArduino().
+# The old 32768 was pure loss: it took 32KB of contiguous internal heap - the
+# very memory the BLE controller needs.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # --- size opt for the large core ---
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
@@ -55,7 +65,7 @@ CONFIG_TFT_SCLK=12
 CONFIG_TFT_CS=10
 CONFIG_TFT_DC=9
 CONFIG_TFT_RST=-1
-CONFIG_TFT_SPI_FREQUENCY=80000000
+CONFIG_TFT_SPI_FREQUENCY=40000000
 CONFIG_TFT_SPI_READ_FREQ=16000000
 CONFIG_TFT_LOAD_FONT2=y
 # CONFIG_ENABLE_BL is not set
@@ -63,3 +73,99 @@ CONFIG_TFT_LOAD_FONT2=y
 # --- USB hub support (keyboard+mouse via self-powered hub) ---
 CONFIG_USB_HOST_HUBS_SUPPORTED=y
 CONFIG_COMPILER_DISABLE_DEFAULT_ERRORS=y
+
+# --- Bluetooth LE HID host (bt_hid.cpp): BLE keyboards/mice ---
+# NOTE: the ESP32-S3 radio is Bluetooth LE ONLY - it has no BR/EDR ("Bluetooth
+# Classic") at all. Only BLE/HOGP peripherals can be used; a Classic-only
+# keyboard or mouse cannot be supported on this chip by any amount of software.
+# USB HID stays enabled on this board: unlike the RGB-panel fork, the serial
+# console here is a separate UART chip, so USB-OTG is free to be a host.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+# Host role: GATT *client* + SMP only. The emulator never advertises or serves.
+CONFIG_BT_GATTC_ENABLE=y
+CONFIG_BT_GATTS_ENABLE=n
+CONFIG_BT_BLE_SMP_ENABLE=y
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+CONFIG_BT_BLE_50_FEATURES_SUPPORTED=n
+# A HID peripheral registers a notification per input report (report protocol
+# devices have several: keyboard, consumer, mouse, battery...).
+# This is the TOTAL number of notification registrations across ALL connected
+# devices, not a per-device figure. A combo keyboard+mouse registers one per
+# input report (keyboard, mouse, consumer, battery...), so two devices overrun
+# a limit of 10 - and the ones that fail belong to the device that connected
+# LAST, which is why a mouse paired after a keyboard connected fine and then
+# delivered no reports at all.
+CONFIG_BT_GATTC_NOTIF_REG_MAX=32
+# Two links is all we need (one keyboard + one mouse); every extra link costs
+# controller RAM, which is the scarcest resource on this board.
+CONFIG_BT_ACL_CONNECTIONS=2
+CONFIG_BT_CTRL_BLE_MAX_ACT=3
+# --- RAM: internal DRAM is nearly full (the emulator's IRAM + static buffers),
+#     so push everything the BT stack can allocate dynamically into PSRAM. ---
+CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
+CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY=y
+CONFIG_BT_STACK_NO_LOG=y
+# Radio work is pinned to core 0 (the emulator owns core 1) so BLE scan/connect
+# activity cannot preempt the CPU loop.
+CONFIG_BT_CTRL_PINNED_TO_CORE_0=y
+CONFIG_BT_BLUEDROID_PINNED_TO_CORE_0=y
+# The scan duplicate-filter cache is plain internal DRAM; we only ever look for
+# one or two HID peripherals, so the 100-entry default is pure waste.
+CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=20
+
+# --- Buy back internal RAM for the BT controller ---
+# None of the code moved out of IRAM below is on a path that runs with the flash
+# cache disabled, so moving it to flash costs nothing but a little speed on cold
+# calls.
+# NOT CONFIG_SPI_FLASH_ROM_IMPL: it swaps in the ROM flash driver, which does not
+# carry IDF's cache-disable coordination between the two cores. With np2kai's
+# multi-megabyte .bss living in PSRAM, core 1 touching that .bss during a flash
+# operation faults as a cache access error (a panic inside bios_memclear()).
+CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+CONFIG_FREERTOS_PLACE_SNAPSHOT_FUNS_INTO_FLASH=y
+CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
+CONFIG_RINGBUF_PLACE_FUNCTIONS_INTO_FLASH=y
+CONFIG_RINGBUF_PLACE_ISR_FUNCTIONS_INTO_FLASH=y
+CONFIG_ESP_PERIPH_CTRL_FUNC_IN_IRAM=n
+CONFIG_SPI_MASTER_ISR_IN_IRAM=n
+CONFIG_SPI_SLAVE_ISR_IN_IRAM=n
+
+# --- arduino-esp32: compile only the libraries this project actually uses ---
+# Forced by the BT switch-on: with CONFIG_BT_ENABLED=y, arduino-esp32 also builds
+# its own BLE wrapper, which does not compile against ESP-IDF v5.5 (BLEDevice.cpp
+# calls esp_ble_gap_get_local_irk(), an IDF 6.x API). We never use it - bt_hid.cpp
+# talks to Bluedroid/esp_hidh directly - so it is excluded.
+#
+# Selective mode is all-or-nothing per library and silently drops any library
+# that has no ARDUINO_SELECTIVE_* switch of its own (ESP_I2S, ESP_NOW, USB,
+# Console...), which then breaks the ones that #include them - ESP_SR needs
+# ESP_I2S.h, so it has to go too. The SPI/FS/SD group is what main.cpp and
+# TFT_eSPI include; everything else is off.
+CONFIG_ARDUINO_SELECTIVE_COMPILATION=y
+CONFIG_ARDUINO_SELECTIVE_SPI=y
+CONFIG_ARDUINO_SELECTIVE_Wire=y
+CONFIG_ARDUINO_SELECTIVE_FS=y
+CONFIG_ARDUINO_SELECTIVE_SD=y
+CONFIG_ARDUINO_SELECTIVE_SD_MMC=y
+CONFIG_ARDUINO_SELECTIVE_SPIFFS=y
+CONFIG_ARDUINO_SELECTIVE_FFat=y
+CONFIG_ARDUINO_SELECTIVE_LittleFS=y
+CONFIG_ARDUINO_SELECTIVE_EEPROM=y
+CONFIG_ARDUINO_SELECTIVE_Preferences=y
+CONFIG_ARDUINO_SELECTIVE_Ticker=y
+CONFIG_ARDUINO_SELECTIVE_Update=y
+CONFIG_ARDUINO_SELECTIVE_BLE=n
+CONFIG_ARDUINO_SELECTIVE_SimpleBLE=n
+CONFIG_ARDUINO_SELECTIVE_BluetoothSerial=n
+CONFIG_ARDUINO_SELECTIVE_ESP_SR=n
+CONFIG_ARDUINO_SELECTIVE_ESP_Video=n
+CONFIG_ARDUINO_SELECTIVE_Zigbee=n
+CONFIG_ARDUINO_SELECTIVE_Network=n
+CONFIG_ARDUINO_SELECTIVE_Ethernet=n
+CONFIG_ARDUINO_SELECTIVE_PPP=n
+CONFIG_ARDUINO_SELECTIVE_Hash=n
+CONFIG_ARDUINO_SELECTIVE_RainMaker=n
+CONFIG_ARDUINO_SELECTIVE_OpenThread=n
+CONFIG_ARDUINO_SELECTIVE_Insights=n

@@ -32,6 +32,12 @@ extern "C" void lcd_menu_line(int row, const char *s, uint16_t fg, uint16_t bg);
 extern "C" int  lcd_get_scale_mode(void);        // lcd_st7789.cpp
 extern "C" void lcd_set_scale_mode(int m);
 extern "C" int  lcd_scale_mode_count(void);      // number of scaler modes to cycle
+extern "C" int  lcd_get_spi_idx(void);           // LCD SPI clock (index into 80/40/20MHz)
+extern "C" void lcd_set_spi_idx(int i);
+extern "C" int  lcd_spi_idx_count(void);
+extern "C" int  lcd_spi_mhz(void);               // current clock, for the menu label
+extern "C" int  lcd_get_rgb444(void);            // 12-bit pixel output (persisted)
+extern "C" void lcd_set_rgb444(int on);
 
 // nkey codes used for navigation. The numeric keypad doubles as arrows here:
 // keypad 8 = up, keypad 2 = down (keypad Enter already maps to RETURN).
@@ -102,9 +108,23 @@ static void draw_drives(int sel) {
                  sel == 5 ? ">" : " ", scnames[lcd_get_scale_mode()]);
         lcd_menu_line(7, line, sel == 5 ? COL_BLACK : COL_WHITE,
                       sel == 5 ? COL_YELLOW : COL_BLACK);
-        snprintf(line, sizeof(line), "%s RESET (save & reboot)", sel == 6 ? ">" : " ");
+        // LCD SPI clock. 80MHz is fastest but out of spec for ST7789 and unstable
+        // on some panels/wiring (noise, dropped pixels, blank screen); the change
+        // shows up on the next redraw, i.e. on this very menu.
+        snprintf(line, sizeof(line), "%s LCD SPI: %dMHz  (RET: change)",
+                 sel == 6 ? ">" : " ", lcd_spi_mhz());
         lcd_menu_line(8, line, sel == 6 ? COL_BLACK : COL_WHITE,
                       sel == 6 ? COL_YELLOW : COL_BLACK);
+        // 12-bit pixels: 25% less SPI traffic, exact for the PC-98 4-bit palette.
+        // Saved to NVS with the rest: a display whose 12-bit decoding is wrong
+        // (an ST7789 emulator, say) has to be able to stay on RGB565.
+        snprintf(line, sizeof(line), "%s LCD color: %s  (RET: change)",
+                 sel == 7 ? ">" : " ", lcd_get_rgb444() ? "RGB444" : "RGB565");
+        lcd_menu_line(9, line, sel == 7 ? COL_BLACK : COL_WHITE,
+                      sel == 7 ? COL_YELLOW : COL_BLACK);
+        snprintf(line, sizeof(line), "%s RESET (save & reboot)", sel == 8 ? ">" : " ");
+        lcd_menu_line(10, line, sel == 8 ? COL_BLACK : COL_WHITE,
+                      sel == 8 ? COL_YELLOW : COL_BLACK);
     }
 }
 
@@ -321,6 +341,8 @@ static void save_settings(void) {
     if (nvs_open("pc98", NVS_READWRITE, &nh) == ESP_OK) {
         nvs_set_u8(nh, "multiple", (uint8_t)np2cfg.multiple);
         nvs_set_u8(nh, "scaler", (uint8_t)lcd_get_scale_mode());
+        nvs_set_u8(nh, "spiidx", (uint8_t)lcd_get_spi_idx());
+        nvs_set_u8(nh, "rgb444", (uint8_t)lcd_get_rgb444());
         // Current mounts (empty drive => empty string; restored as empty at boot).
         nvs_set_str(nh, "fdd0", (const char *)np2cfg.fddfile[0]);
         nvs_set_str(nh, "fdd1", (const char *)np2cfg.fddfile[1]);
@@ -339,7 +361,7 @@ extern "C" void menu_disk_run(void) {
         if (!dn) continue;
         if (nk == NK_ESC) break;
         if (key_is_up(nk)   && sel > 0) sel--;
-        if (key_is_down(nk) && sel < 6) sel++;
+        if (key_is_down(nk) && sel < 8) sel++;
         if (nk == NK_RET) {
             if (sel == 3) {                     // create blank disk image
                 newdisk_flow();
@@ -350,7 +372,11 @@ extern "C" void menu_disk_run(void) {
                 if (m > 5) m = 1;
                 np2cfg.multiple = m;            // display follows immediately
                 g_speed_req = (int)m;           // emulator loop applies it
-            } else if (sel == 6) {              // RESET: persist the 5 items, reboot
+            } else if (sel == 6) {              // LCD SPI clock: cycle 80/40/20MHz
+                lcd_set_spi_idx((lcd_get_spi_idx() + 1) % lcd_spi_idx_count());
+            } else if (sel == 7) {              // LCD colour depth: RGB565 <-> RGB444
+                lcd_set_rgb444(!lcd_get_rgb444());
+            } else if (sel == 8) {              // RESET: persist the settings, reboot
                 save_settings();
                 esp_restart();
             } else {

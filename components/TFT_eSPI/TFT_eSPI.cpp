@@ -37,6 +37,11 @@
   #define SPI_BUSY_CHECK
 #endif
 
+// Runtime SPI write clock (see TFT_eSPI.h). Changing it takes effect on the next
+// begin_tft_write(); a 32-bit store is atomic, so no locking is needed as long as
+// the caller is not itself inside a transaction.
+uint32_t tft_spi_write_freq = SPI_FREQUENCY;
+
 // Clipping macro for pushImage
 #define PI_CLIP                                        \
   if (_vpOoB) return;                                  \
@@ -75,7 +80,7 @@ inline void TFT_eSPI::begin_tft_write(void){
   if (locked) {
     locked = false; // Flag to show SPI access now unlocked
 #if defined (SPI_HAS_TRANSACTION) && defined (SUPPORT_TRANSACTIONS) && !defined(TFT_PARALLEL_8_BIT) && !defined(RP2040_PIO_INTERFACE)
-    spi.beginTransaction(SPISettings(SPI_FREQUENCY, MSBFIRST, TFT_SPI_MODE));
+    spi.beginTransaction(SPISettings(tft_spi_write_freq, MSBFIRST, TFT_SPI_MODE));
 #endif
     CS_L;
     SET_BUS_WRITE_MODE;  // Some processors (e.g. ESP32) allow recycling the tx buffer when rx is not used
@@ -87,7 +92,7 @@ void TFT_eSPI::begin_nin_write(void){
   if (locked) {
     locked = false; // Flag to show SPI access now unlocked
 #if defined (SPI_HAS_TRANSACTION) && defined (SUPPORT_TRANSACTIONS) && !defined(TFT_PARALLEL_8_BIT) && !defined(RP2040_PIO_INTERFACE)
-    spi.beginTransaction(SPISettings(SPI_FREQUENCY, MSBFIRST, TFT_SPI_MODE));
+    spi.beginTransaction(SPISettings(tft_spi_write_freq, MSBFIRST, TFT_SPI_MODE));
 #endif
     CS_L;
     SET_BUS_WRITE_MODE;  // Some processors (e.g. ESP32) allow recycling the tx buffer when rx is not used
@@ -164,7 +169,7 @@ inline void TFT_eSPI::end_tft_read(void){
   }
 #else
   #if !defined(TFT_PARALLEL_8_BIT) && !defined(RP2040_PIO_INTERFACE)
-    spi.setFrequency(SPI_FREQUENCY);
+    spi.setFrequency(tft_spi_write_freq);
   #endif
    if(!inTransaction) {CS_H;}
 #endif

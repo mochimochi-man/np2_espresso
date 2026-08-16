@@ -1,2 +1,4 @@
 build 20260808 first release.
 build 20260809 optimazed and included binary in package.
+build 20260814 LCD SPI clock selectable (40MHz default) and RGB444 output.
+build 20260816 Bluetooth LE keyboard/mouse support.

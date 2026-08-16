@@ -4,10 +4,16 @@
 // translated to PC-98 key scancodes (NKEY_*) and queued; the emulator task
 // drains the queue and calls keystat_keydown/keyup. USB host structure follows
 // the Anemoia-ESP32 usb_controller.cpp reference (same hid_host component).
+//
+// This file also owns the transport-independent half of the input path (the
+// usage->NKEY table, the key queue, the mouse accumulators) - see hid_input.h.
+// bt_hid.cpp feeds the very same functions from Bluetooth LE.
 
 #include <Arduino.h>
 #include "usb/hid_host.h"
 #include "usb/usb_host.h"
+#include "hid_input.h"
+#include "esp_timer.h"
 
 extern "C" {
     void keystat_keydown(unsigned char ref);
@@ -22,30 +28,39 @@ static uint8_t s_hid2nkey[256];
 static QueueHandle_t s_kq;
 static QueueHandle_t s_hid_evtq;
 
-static uint8_t s_prevkeys[6];
-static uint8_t s_prevmod;
+// Previous report, per transport (see HID_SRC_* in hid_input.h).
+static uint8_t s_prevkeys[HID_SRC_MAX][6];
+static uint8_t s_prevmod[HID_SRC_MAX];
 
 // Set when Pause/Break is pressed: the emulator loop opens the disk swap menu.
 volatile int g_menu_req = 0;
 // Set by the disk menu's CPU row: the emulator loop applies the new multiple.
 volatile int g_speed_req = 0;
 
-// Real USB mouse (HID boot protocol, 3-byte report: buttons/dx/dy). Read by
+// Real mouse (USB boot protocol or BLE report protocol). Read by
 // mousemng_getstat() in platform_stubs.cpp.
 volatile int16_t g_umouse_dx = 0, g_umouse_dy = 0;   // accumulated deltas
 volatile uint8_t g_umouse_btn = 0xA0;                // uPD8255 active-low (0x80=L, 0x20=R)
-volatile int     g_umouse_present = 0;
+volatile int     g_umouse_present = 0;               // refcount: USB + BLE mice
 
-// Parse a boot mouse report. byte0: bit0=L bit1=R; byte1: dx (int8); byte2: dy.
-static void mouse_report(const uint8_t *d, int len) {
-    if (len < 3) return;
-    g_umouse_dx = (int16_t)(g_umouse_dx + (int8_t)d[1]);
-    g_umouse_dy = (int16_t)(g_umouse_dy + (int8_t)d[2]);
+// Accumulate movement + latch buttons. buttons: bit0=L bit1=R bit2=M.
+extern "C" void hid_mouse_delta(int dx, int dy, uint8_t buttons) {
+    g_umouse_dx = (int16_t)(g_umouse_dx + dx);
+    g_umouse_dy = (int16_t)(g_umouse_dy + dy);
     uint8_t btn = g_umouse_btn;
-    if (d[0] & 0x01) btn &= ~0x80; else btn |= 0x80;   // left  (active low)
-    if (d[0] & 0x02) btn &= ~0x20; else btn |= 0x20;   // right (active low)
+    if (buttons & 0x01) btn &= ~0x80; else btn |= 0x80;   // left  (active low)
+    if (buttons & 0x02) btn &= ~0x20; else btn |= 0x20;   // right (active low)
     g_umouse_btn = btn;
 }
+
+// Boot mouse report. byte0: bit0=L bit1=R; byte1: dx (int8); byte2: dy.
+extern "C" void hid_mouse_boot_report(const uint8_t *d, int len) {
+    if (len < 3) return;
+    hid_mouse_delta((int8_t)d[1], (int8_t)d[2], d[0]);
+}
+
+extern "C" void hid_mouse_attach(void) { g_umouse_present++; }
+extern "C" void hid_mouse_detach(void) { if (g_umouse_present > 0) g_umouse_present--; }
 
 static void kq_push(uint8_t nkey, uint8_t down) {
     if (nkey == 0xff || !s_kq) return;
@@ -63,9 +78,49 @@ extern "C" int usb_kbd_pop(uint8_t *nkey, uint8_t *down) {
     return 1;
 }
 
+// Temporary: dump every keyboard report plus the PC-98 code its first two key
+// slots map to, so a key that "does not type" can be traced either to the report
+// itself or to the usage->NKEY table. Set to 0 for normal builds.
+#define HID_KBD_TRACE 0
+
+// HID usages that open the disk menu. Pause/Break is the classic one, but many
+// compact keyboards (and most Bluetooth ones) simply do not have that key, so
+// F11 and F12 open it too: the PC-98 keyboard stops at F10, which leaves those
+// two with no emulated meaning to lose. PrintScreen is deliberately NOT in this
+// list - it carries the PC-98 COPY key.
+static bool hid_is_menu_key(uint8_t k) {
+    return k == 0x48       // Pause / Break
+        || k == 0x44       // F11
+        || k == 0x45;      // F12
+}
+
 // Parse an 8-byte HID boot keyboard report and queue press/release deltas.
-static void kbd_report(const uint8_t *d, int len) {
-    if (len < 8) return;
+extern "C" void hid_kbd_report(int src, const uint8_t *d, int len) {
+    if (len < 8 || (unsigned)src >= HID_SRC_MAX) return;
+#if HID_KBD_TRACE
+    // The keyboard streams idle (all-zero) reports continuously, and a serial
+    // capture rarely overlaps the moment a key is pressed - so keep the reports
+    // that actually carry something and re-print the list every few seconds.
+    {
+        static uint8_t hist[16][8];
+        static int nhist = 0;
+        static int64_t last_dump = 0;
+        bool nonzero = false;
+        for (int i = 0; i < 8; i++) if (d[i]) nonzero = true;
+        if (nonzero && nhist < 16) { memcpy(hist[nhist], d, 8); nhist++; }
+        int64_t now = esp_timer_get_time();
+        if (nhist && (now - last_dump) > 5000000) {
+            last_dump = now;
+            ets_printf("--- kbd history (%d) ---\n", nhist);
+            for (int i = 0; i < nhist; i++)
+                ets_printf("  mod=%02x keys %02x %02x %02x %02x %02x %02x -> nkey %02x %02x\n",
+                           hist[i][0], hist[i][2], hist[i][3], hist[i][4],
+                           hist[i][5], hist[i][6], hist[i][7],
+                           s_hid2nkey[hist[i][2]], s_hid2nkey[hist[i][3]]);
+        }
+    }
+#endif
+    uint8_t *prevkeys = s_prevkeys[src];
     // modifiers: L/R shift, L/R ctrl, L/R alt(->GRPH)
     static const struct { uint8_t bit, nkey; } mods[] = {
         { 0x02, 0x70 }, { 0x20, 0x70 },   // shift
@@ -74,14 +129,14 @@ static void kbd_report(const uint8_t *d, int len) {
     };
     uint8_t mod = d[0];
     for (unsigned i = 0; i < sizeof(mods) / sizeof(mods[0]); i++) {
-        uint8_t now = mod & mods[i].bit, was = s_prevmod & mods[i].bit;
+        uint8_t now = mod & mods[i].bit, was = s_prevmod[src] & mods[i].bit;
         if (now && !was) kq_push(mods[i].nkey, 1);
         else if (!now && was) kq_push(mods[i].nkey, 0);
     }
-    s_prevmod = mod;
+    s_prevmod[src] = mod;
     // released keys (in prev, not in current)
     for (int i = 0; i < 6; i++) {
-        uint8_t k = s_prevkeys[i];
+        uint8_t k = prevkeys[i];
         if (k <= 1) continue;
         bool still = false;
         for (int j = 2; j < 8; j++) if (d[j] == k) still = true;
@@ -92,16 +147,16 @@ static void kbd_report(const uint8_t *d, int len) {
         uint8_t k = d[j];
         if (k <= 1) continue;
         bool had = false;
-        for (int i = 0; i < 6; i++) if (s_prevkeys[i] == k) had = true;
+        for (int i = 0; i < 6; i++) if (prevkeys[i] == k) had = true;
         if (!had) {
-            if (k == 0x48) {
-                g_menu_req = 1;                     // Pause/Break = disk swap menu
+            if (hid_is_menu_key(k)) {
+                g_menu_req = 1;                     // opens the disk swap menu
             } else {
                 kq_push(s_hid2nkey[k], 1);
             }
         }
     }
-    for (int i = 0; i < 6; i++) s_prevkeys[i] = d[i + 2];
+    for (int i = 0; i < 6; i++) prevkeys[i] = d[i + 2];
 }
 
 // ---- hid_host plumbing (mirrors Anemoia usb_controller.cpp) ----
@@ -118,12 +173,12 @@ static void hid_iface_cb(hid_host_device_handle_t handle,
     switch (event) {
     case HID_HOST_INTERFACE_EVENT_INPUT_REPORT:
         if (hid_host_device_get_raw_input_report_data(handle, data, sizeof(data), &len) == ESP_OK) {
-            if (arg == (void *)HID_PROTOCOL_MOUSE) mouse_report(data, (int)len);
-            else kbd_report(data, (int)len);
+            if (arg == (void *)HID_PROTOCOL_MOUSE) hid_mouse_boot_report(data, (int)len);
+            else hid_kbd_report(HID_SRC_USB, data, (int)len);
         }
         break;
     case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
-        if (arg == (void *)HID_PROTOCOL_MOUSE) { g_umouse_present = 0; ets_printf("usb_kbd: mouse disconnected\n"); }
+        if (arg == (void *)HID_PROTOCOL_MOUSE) { hid_mouse_detach(); ets_printf("usb_kbd: mouse disconnected\n"); }
         hid_host_device_close(handle);
         break;
     default: break;
@@ -141,7 +196,7 @@ static void hid_dev_event(hid_host_device_handle_t handle,
         // Boot protocol => fixed reports we know how to parse (kbd 8B / mouse 3B).
         hid_class_request_set_protocol(handle, HID_REPORT_PROTOCOL_BOOT);
         hid_host_device_start(handle);
-        if (p.proto == HID_PROTOCOL_MOUSE) { g_umouse_present = 1; ets_printf("usb_kbd: mouse connected\n"); }
+        if (p.proto == HID_PROTOCOL_MOUSE) { hid_mouse_attach(); ets_printf("usb_kbd: mouse connected\n"); }
         else ets_printf("usb_kbd: keyboard connected\n");
     }
 }
@@ -171,7 +226,10 @@ static void usb_lib_task(void *arg) {
     }
 }
 
-extern "C" void usb_kbd_init(void) {
+// HID usage -> PC-98 NKEY table + key queue. Shared by the USB and BLE hosts;
+// whichever starts first builds it, the second call is a no-op.
+extern "C" void hid_map_init(void) {
+    if (s_kq) return;
     for (int i = 0; i < 256; i++) s_hid2nkey[i] = 0xff;
     // letters a..z (HID 0x04..0x1d) -> PC-98 codes
     static const uint8_t letters[26] = {
@@ -241,6 +299,10 @@ extern "C" void usb_kbd_init(void) {
     s_hid2nkey[0x63] = 0x50;  // KP .
 
     s_kq = xQueueCreate(64, sizeof(uint16_t));
+}
+
+extern "C" void usb_kbd_init(void) {
+    hid_map_init();
     s_hid_evtq = xQueueCreate(10, sizeof(hid_evt_t));
 
     xTaskCreatePinnedToCore(usb_lib_task, "usb_lib", 4096, xTaskGetCurrentTaskHandle(), 2, NULL, 0);

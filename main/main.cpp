@@ -38,6 +38,7 @@ bool lcd_blit_busy(void);            // lcd_st7789.cpp: core-0 blit still readin
 void lcd_set_scale_mode(int m);      // lcd_st7789.cpp: 0=MAX 1=AVG 2=MID 3=1:1
 int  lcd_scale_mode_count(void);     // lcd_st7789.cpp: valid modes are 0..count-1
 void usb_kbd_init(void);           // usb_kbd.cpp: USB HID keyboard host
+void bt_hid_init(void);            // bt_hid.cpp: Bluetooth LE (HOGP) keyboard/mouse host
 int  usb_kbd_pop(uint8_t *nkey, uint8_t *down);  // drain one key event
 extern volatile int g_menu_req;      // usb_kbd.cpp: Pause/Break -> disk swap menu
 extern volatile int g_speed_req;     // menu_disk.cpp: CPU clock row -> new multiple (1..5)
@@ -156,11 +157,38 @@ static void emu_task(void *arg);
 // heap: moving the hot CPU data (szpflag_w etc.) into internal DRAM fragmented
 // the heap so a 64KB contiguous heap block was no longer available. A static
 // stack sidesteps heap fragmentation entirely.
-#define EMU_STACK_WORDS (56 * 1024 / sizeof(StackType_t))
+// 36KB, not 56KB. This is static .bss in internal RAM - the same pool the BLE
+// controller allocates a connection from, and it had run down to 46 bytes free
+// ("BLE_INIT: Malloc failed" the moment a keyboard was found). Measured with
+// uxTaskGetStackHighWaterMark right after a full DOS boot (the deepest disk and
+// BIOS paths): 22,820 bytes actually used, so 36KB keeps a 13KB margin and hands
+// 20KB back to the heap.
+#define EMU_STACK_WORDS (36 * 1024 / sizeof(StackType_t))
 static StackType_t  emu_stack[EMU_STACK_WORDS];
 static StaticTask_t emu_tcb;
 
 extern "C" void app_main(void) {
+    // NVS before Bluetooth: the controller keeps its RF calibration data and its
+    // bonding keys there, so starting it first means the radio is fully
+    // recalibrated on every boot ("failed to load RF calibration data") and
+    // paired devices may not be remembered across a power cycle. emu_task calls
+    // nvs_flash_init() again later for the disk settings; it is idempotent.
+    {
+        esp_err_t nerr = nvs_flash_init();
+        if (nerr == ESP_ERR_NVS_NO_FREE_PAGES || nerr == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            nvs_flash_erase();
+            nvs_flash_init();
+        }
+    }
+
+    // Bluetooth LE HID host next, before anything else allocates. The BLE
+    // controller needs a single ~44KB contiguous block of internal DMA memory,
+    // and contiguity - not the total free count - is what decides whether it
+    // comes up: by the time Arduino, the LCD and SD have taken their buffers,
+    // the largest remaining block is far below that. bt_hid_init() checks the
+    // block itself and skips Bluetooth rather than crashing if it is too small.
+    bt_hid_init();
+
     // Silence the power-on/reboot speaker noise: the I2S pins float from reset
     // until audio_init() runs (seconds later). Drive BCK/WS/DOUT low at once.
     gpio_config_t io = {};
@@ -236,6 +264,15 @@ static void emu_task(void *arg) {
     // FDC reset (io/fdc.c), and diskdrv_readyfddex() refuses a drive whose equip
     // bit is clear — so drive 1 (FDD2) needs bit 1 set here.
     np2cfg.fddequip |= 0x03;
+
+    // 1.44MB floppy support. fdc_reset() copies this into fdc.support144, and
+    // without it setfdcmode() rejects every 1.44MB access (bios1b.c: "if ((rpm)
+    // && (!fdc.support144)) return FAILURE") - the BIOS then cannot read the
+    // disk's first sector and simply stops after the memory count, with no error
+    // and no BASIC banner. A 1.2MB disk is unaffected either way, so this is
+    // always on: the emulated VX gains the 1.44MB drive interface (port 0x4be)
+    // that later real machines had.
+    np2cfg.usefd144 = 1;
 
     // --- HDD (SASI/IDE fixed drive 0). hddbind() inside pccore_reset() opens
     //     sasihdd[0], so the image must be set BEFORE then. The path is chosen
@@ -330,6 +367,14 @@ static void emu_task(void *arg) {
     printf("fddequip=%02X  fdd_diskready(0)=%d  fdd_diskready(1)=%d\n",
            np2cfg.fddequip, (int)fdd_diskready(0), (int)fdd_diskready(1));
 
+    // Internal DMA RAM is the scarce resource once Bluetooth is on (the BLE
+    // controller alone holds ~44KB): the I2S driver and the SD driver both
+    // allocate from it, and they fail silently-ish when it runs out - no audio,
+    // or disk reads that return ESP_ERR_NO_MEM and leave the BIOS unable to boot.
+    // Print it at every boot so a shortage is visible before it bites.
+    printf("internal DMA heap: free=%u largest=%u\n",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     banner("running");
     printf("free after reset: internal=%u psram=%u largest_psram=%u\n",
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram(),

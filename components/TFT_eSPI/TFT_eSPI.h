@@ -122,6 +122,12 @@
   #define SPI_FREQUENCY  20000000
 #endif
 
+// np2 espresso addition: runtime-adjustable SPI write clock (Hz). Initialised to
+// SPI_FREQUENCY and read by begin_tft_write() on every transaction start, so the
+// app can lower it while running (some ST7789 panels/wiring are unstable at
+// 80MHz). Reads still use the fixed SPI_READ_FREQUENCY.
+extern uint32_t tft_spi_write_freq;
+
 // If the SPI read frequency is not defined, set a default
 #ifndef SPI_READ_FREQUENCY
   #define SPI_READ_FREQUENCY 10000000

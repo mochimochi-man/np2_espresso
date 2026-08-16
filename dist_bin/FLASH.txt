@@ -2,7 +2,7 @@ np2_espresso - prebuilt firmware (final distribution build)
 ============================================================
 
 Target: ESP32-S3 (N16R8 / 16MB flash / 8MB Octal PSRAM)
-Build : build 20260808 (interpreter memory-access fast-path, ~24% faster CPU loop)
+Build : build 20260814 (LCD SPI clock selectable, 40MHz default; RGB444 output)
 
 Flash with esptool (replace PORT, e.g. COM21 or /dev/ttyACM0):
 
