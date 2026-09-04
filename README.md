@@ -143,11 +143,6 @@ one in over USB.
 - From the menu you can mount FDD1/FDD2/HDD disk images, change the CPU priority,
   switch the downscaling algorithm, and set the **LCD SPI clock** and the
   **LCD colour depth**.
-- The rows that hold a value — **CPU clock**, **DISP**, **LCD SPI** and
-  **LCD color** — also take the **left and right arrows**. The arrows step one
-  either way and stop at the ends; **RET** steps up and wraps round at the top.
-  Keypad **4** / **6** do the same, matching keypad **8** / **2** for moving up
-  and down.
 - **DISP**: the attached panel and the downscaler, shown together as e.g.
   ST7789/AVG. One firmware drives either an **ST7789 240x320** or an
   **ST7796 320x480**; changing the panel needs a RESET. ST7796 has no 12-bit
