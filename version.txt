@@ -4,13 +4,6 @@ build 20260814 LCD SPI clock selectable (40MHz default) and RGB444 output.
 build 20260816 Bluetooth LE keyboard/mouse support.
 build 20260817 TFT_eSPI replaced by ESP-IDF native esp_lcd.
 build 20260820 ST7796 panel support, ROM file selection from the menu.
-build 20260905 USB Mode (microSD as a USB mass storage device).
-               FM sound: fixed samples being dropped, heard as a buzz on
-               sustained low notes.
-               USB keyboard: fixed it sometimes coming up dead and staying
-               that way until replugged.
-               Menu: LEFT/RIGHT adjust CPU clock, DISP, LCD SPI and LCD color.
-               LCD color could not be changed at all; RGB444 is available
-               again on the ST7789.
-               The built-in BIOS is used when the selected BIOS.ROM is the
-               wrong size, instead of falling back to the emulated BIOS.
+build 20260905 USB Mode added(microSD as a USB mass storage device).
+               FM sound fixed.
+               USB keyboard fixed. it sometimes coming up dead.
