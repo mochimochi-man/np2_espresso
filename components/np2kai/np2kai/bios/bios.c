@@ -1,3 +1,5 @@
+extern int ets_printf(const char *fmt, ...);
+extern char g_bios_file[];   /* menu setting: chosen BIOS*.ROM, "" = the default */
 /**
  * @file	bios.c
  * @brief	Implementation of BIOS
@@ -81,7 +83,12 @@ static void trace_fmt_ex(const char *fmt, ...)
 
 #define	BIOS_SIMULATE
 
-static const char neccheck[] = "Copyright (C) 1983 by NEC Corporation";
+/* NEC's own MS-DOS identifies the machine from a signature in the BIOS window
+   and will not run without it - that is how it keeps itself off EPSON
+   machines. np2kai used to supply one when no ROM image was loaded; this
+   build does not, so that DOS needs a BIOS.ROM dumped from an NEC machine,
+   which is what the documentation asks for anyway. EPSON DOS, and everything
+   that does not check, are unaffected. */
 
 typedef struct {
 	UINT8	port;
@@ -440,12 +447,55 @@ void bios_initialize(void) {
 #endif
 
 	biosrom = FALSE;
-	getbiospath(path, str_biosrom, NELEMENTS(path));
 	if(np2cfg.usebios){
-		fh = file_open_rb(path);
+		/* BIOS_ESP.ROM (the compatible BIOS built in pc98_bios_compat/) is tried
+		   first, so it can be dropped next to bios.rom on the SD card and the
+		   two compared without moving files around. Falls back to bios.rom. */
+		fh = FILEH_INVALID;
+		if (g_bios_file[0]) {
+			/* The menu stores a name picked from the SD root ("/BIOS_ESP.ROM"),
+			   so a compatible ROM and one dumped from real hardware can both
+			   live on the card. getbiospath() prepends the BIOS directory, so
+			   the leading slash is skipped here. */
+			getbiospath(path, (const OEMCHAR *)(g_bios_file + (g_bios_file[0] == 0x2f ? 1 : 0)),
+			            NELEMENTS(path));
+			fh = file_open_rb(path);
+		}
+		if (fh == FILEH_INVALID) {
+			getbiospath(path, str_biosrom, NELEMENTS(path));
+			fh = file_open_rb(path);
+		}
 		if (fh != FILEH_INVALID) {
 			biosrom = (file_read(fh, mem + 0x0e8000, 0x18000) == 0x18000);
 			file_close(fh);
+		}
+		/* Which of the two was actually taken, and whether it was the right
+		   size: with two candidate files on the card this is the first thing
+		   worth knowing when the machine does not come up. */
+		ets_printf("biosrom: %s -> %s\n", path, biosrom ? "loaded" : "REJECTED/absent");
+
+		/* A file that opens but is not 0x18000 bytes leaves biosrom FALSE and falls
+		   out of the bottom of the test below into np2's own emulated BIOS. That is
+		   a reasonable place to end up when there is no ROM at all, but not when the
+		   menu named one: the fallback above only fires when the file will not open,
+		   so a wrong size had nothing to catch it and the choice was silently not
+		   the thing that ran.
+
+		   So a size failure falls back to bios.rom the same way an open failure
+		   does. If that is the file that was just rejected, or is the wrong size
+		   too, nothing has changed and the emulated BIOS still takes over. */
+		if (!biosrom) {
+			OEMCHAR	defpath[MAX_PATH];
+			getbiospath(defpath, str_biosrom, NELEMENTS(defpath));
+			if (file_cmpname(path, defpath) != 0) {
+				fh = file_open_rb(defpath);
+				if (fh != FILEH_INVALID) {
+					biosrom = (file_read(fh, mem + 0x0e8000, 0x18000) == 0x18000);
+					file_close(fh);
+				}
+				ets_printf("biosrom: wrong size, using %s -> %s\n",
+				           defpath, biosrom ? "loaded" : "REJECTED/absent");
+			}
 		}
 	}
 	if (biosrom) {
@@ -465,7 +515,6 @@ void bios_initialize(void) {
 	else {
 		CopyMemory(mem + 0x0e8000, nosyscode, sizeof(nosyscode));
 		if ((!biosrom) && (!(pccore.model & PCMODEL_EPSON))) {
-			CopyMemory(mem + 0xe8dd8, neccheck, 0x25);
 			pos = LOADINTELWORD(itfrom + 2);
 			CopyMemory(mem + 0xf538e, itfrom + pos, 0x27);
 		}
