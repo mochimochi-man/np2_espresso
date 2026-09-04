@@ -15,6 +15,7 @@
 #include <string.h>
 #include "driver/i2s.h"                 // legacy driver (matches Anemoia)
 #include "freertos/stream_buffer.h"
+#include "freertos/idf_additions.h"     // xStreamBufferCreateWithCaps
 #include "pie_simd.h"                   // ESP32-S3 PIE SIMD helpers (np2kai shim)
 
 extern "C" int ets_printf(const char *fmt, ...);
@@ -39,11 +40,31 @@ static int                 s_checks = 0, s_fails = 0, s_pie_calls = 0;
 volatile int g_audio_peak  = 0;   // max |sample| pre-clip (>32767 = clipping)
 volatile int g_audio_drops = 0;   // stereo frames the ring couldn't accept (overflow)
 volatile int g_audio_under = 0;   // ring-empty events (starvation: DAC underruns = crackle)
+// g_audio_under only fires when the ring stays empty for a whole 100ms, which is
+// far too coarse for a click: the DMA holds 46ms, so a stall a twentieth of that
+// long is already audible and is counted as nothing at all.
+//
+// What actually says whether the DAC ran dry is the audio clock against the wall
+// clock. Every frame handed to i2s_write is 1/rate of a second of sound, so the
+// sound handed over since a run began has a known duration; if more wall time
+// than that has passed, the difference is silence the DAC played because there
+// was nothing to play. Nothing here depends on whether i2s_write blocked, which
+// is what made the first attempt at this useless: the gap between writes is long
+// when things are HEALTHY (the DMA is full and the write waits) and short when
+// they are not.
+volatile int g_audio_defus = 0;   // worst shortfall of audio time vs wall time (us)
 
 // ---- core 0 task: drain the ring into the DAC, blocking so nothing is dropped ----
 static void audio_task(void *arg) {
     (void)arg;
     static int16_t rx[512 * 2];
+    int carry = 0;                 // bytes of a split frame held over (see below)
+    // A "run" is an unbroken stretch of playback. It starts at the first write
+    // after silence and is timed from there; a gap long enough to empty the ring
+    // ends it, because after that the DAC has legitimately nothing to play and
+    // measuring it against the wall clock would only count the silence.
+    int64_t run_start = 0;         // us, 0 = no run in progress
+    int64_t run_frames = 0;        // frames handed to the DAC in this run
 #if AUDIO_TESTTONE
     double ph = 0; const double k = 2*M_PI*440/s_rate;
     for (;;) {
@@ -54,9 +75,40 @@ static void audio_task(void *arg) {
     for (;;) {
         // 100ms timeout: expiring means the producer (core 1, slower than real time
         // under load) starved the DAC -> the DMA auto-clear outputs zeros = crackle.
-        size_t n = xStreamBufferReceive(s_ring, rx, sizeof(rx), pdMS_TO_TICKS(100));
-        if (n) { size_t wr = 0; i2s_write(I2S_NUM_0, rx, n, &wr, portMAX_DELAY); }
-        else g_audio_under++;
+        size_t n = xStreamBufferReceive(s_ring, (uint8_t *)rx + carry,
+                                        sizeof(rx) - carry, pdMS_TO_TICKS(100));
+        if (!n) {
+            g_audio_under++;
+            run_start = 0;         // the run is over; do not time the silence
+            continue;
+        }
+        n += carry;
+        // A stereo s16 frame is 4 bytes and the ring is byte-oriented, so a send
+        // that only partly fitted leaves a boundary mid-frame and what comes back
+        // here is not always a whole number of frames. Handing i2s_write a count
+        // that is not a multiple of 4 shifts the L/R phase by half a sample, and it
+        // stays shifted until another odd count cancels it - heard as noise that
+        // comes and goes. Carry the tail over to the next block instead.
+        size_t play = n & ~(size_t)3;
+        carry = (int)(n - play);
+        if (play) {
+            size_t wr = 0;
+            i2s_write(I2S_NUM_0, rx, play, &wr, portMAX_DELAY);
+            const int64_t now = esp_timer_get_time();
+            if (!run_start) {
+                run_start = now;
+                run_frames = 0;
+            } else {
+                run_frames += (int64_t)(play / 4);       // stereo s16 = 4B/frame
+                const int64_t sound_us = run_frames * 1000000 / s_rate;
+                // Wall time past the sound handed over is silence the DAC filled
+                // in. Under 46ms the DMA still had something buffered, so it is
+                // headroom being used rather than a hole; past that it is one.
+                const int64_t deficit = (now - run_start) - sound_us;
+                if (deficit > g_audio_defus) g_audio_defus = (int)deficit;
+            }
+        }
+        if (carry) memmove(rx, (const uint8_t *)rx + play, carry);
     }
 #endif
 }
@@ -106,12 +158,21 @@ extern "C" bool audio_init(int rate, int maxframes) {
     if (!raw_ref) { ets_printf("audio: alloc FAIL\n"); return false; }
     s_ref = (int16_t *)(((uintptr_t)raw_ref + 15) & ~(uintptr_t)15);
 #endif
-    size_t ringbytes = (size_t)maxframes * 2 * sizeof(int16_t) * 6;   // ~120ms: absorb load jitter
-    s_ring = xStreamBufferCreate(ringbytes, 1);
+    size_t ringbytes = (size_t)maxframes * 2 * sizeof(int16_t) * 10;  // ~200ms. Measured better than 120ms on the RGB board: the shorter
+                                                                     // ring refills more often, so the producer is throttled more
+                                                                     // frequently and the stutter is worse, not better. The audible
+                                                                     // case is a BGM change, where the game loads from the card and
+                                                                     // the emulator stalls for longer than 120ms of audio.
+    // In PSRAM, not internal RAM: this is ~17KB and only ever touched from
+    // tasks (np2 on core 1 writes, the audio task on core 0 drains) — never
+    // from an ISR, so it has no reason to sit in the internal pool that the
+    // BLE controller, the I2S DMA descriptors and the SD driver are competing
+    // over. That pool is the scarce one on this board.
+    s_ring = xStreamBufferCreateWithCaps(ringbytes, 1, MALLOC_CAP_SPIRAM);
 #if NP2_SIMD_SELFCHECK
     if (!s_buf || !s_ring || !s_ref) { ets_printf("audio: alloc FAIL\n"); return false; }
 #else
-    if (!s_buf || !s_ring) { ets_printf("audio: alloc FAIL\n"); return false; }
+    if (!s_buf || !s_ring) { ets_printf("audio: ring alloc FAIL (%u bytes psram)\n", (unsigned)ringbytes); return false; }
 #endif
     s_ok = true;
     xTaskCreatePinnedToCore(audio_task, "audio", 3072, nullptr, 6, nullptr, 0);

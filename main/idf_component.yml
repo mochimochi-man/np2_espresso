@@ -3,3 +3,4 @@ dependencies:
   espressif/arduino-esp32:
     version: "^3.3.0"
   espressif/usb_host_hid: "^1.0.0"
+  espressif/tinyusb: "^0.21.0"

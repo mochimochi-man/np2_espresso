@@ -65,7 +65,20 @@ extern "C" void hid_mouse_detach(void) { if (g_umouse_present > 0) g_umouse_pres
 static void kq_push(uint8_t nkey, uint8_t down) {
     if (nkey == 0xff || !s_kq) return;
     uint16_t ev = (uint16_t)((nkey << 1) | (down & 1));
-    xQueueSend(s_kq, &ev, 0);
+    if (xQueueSend(s_kq, &ev, 0) != pdTRUE) {
+        // Nobody is draining. The keyboard then looks dead while everything else
+        // carries on, and silently dropping the event is what makes that so hard
+        // to tell from a USB fault - so say it, but not on every key.
+        static int64_t last = 0;
+        static int lost = 0;
+        lost++;
+        const int64_t now = esp_timer_get_time();
+        if (now - last > 2000000) {
+            last = now;
+            ets_printf("usb_kbd: key queue full - %d event(s) lost\n", lost);
+            lost = 0;
+        }
+    }
 }
 
 // Pop one key event for the emulator loop. Returns 1 if an event was returned.
@@ -177,8 +190,31 @@ static void hid_iface_cb(hid_host_device_handle_t handle,
             else hid_kbd_report(HID_SRC_USB, data, (int)len);
         }
         break;
+    case HID_HOST_INTERFACE_EVENT_TRANSFER_ERROR:
+        // The driver reports the failed IN transfer and does not resubmit it, so
+        // a single glitched transfer used to end the keyboard for good: the
+        // device stayed enumerated, nothing was logged, and only unplugging it
+        // brought it back. That is the "the keyboard stops working sometimes"
+        // this board does under memory pressure.
+        //
+        // Ask for the transfer again. If the device really has gone away the
+        // restart fails harmlessly and DISCONNECTED arrives right behind it.
+        ets_printf("usb_kbd: %s transfer error - restarting\n",
+                   arg == (void *)HID_PROTOCOL_MOUSE ? "mouse" : "keyboard");
+        hid_host_device_start(handle);
+        break;
     case HID_HOST_INTERFACE_EVENT_DISCONNECTED:
-        if (arg == (void *)HID_PROTOCOL_MOUSE) { hid_mouse_detach(); ets_printf("usb_kbd: mouse disconnected\n"); }
+        if (arg == (void *)HID_PROTOCOL_MOUSE) {
+            hid_mouse_detach();
+            ets_printf("usb_kbd: mouse disconnected\n");
+        } else {
+            // Whatever was held down goes with it. Without this an unplug while
+            // a key is pressed leaves that key down in the PC-98 matrix for
+            // good, because the release report can no longer arrive.
+            static const uint8_t none[8] = { 0 };
+            hid_kbd_report(HID_SRC_USB, none, sizeof(none));
+            ets_printf("usb_kbd: keyboard disconnected\n");
+        }
         hid_host_device_close(handle);
         break;
     default: break;
@@ -191,11 +227,38 @@ static void hid_dev_event(hid_host_device_handle_t handle,
     if (hid_host_device_get_params(handle, &p) != ESP_OK) return;
     if (event == HID_HOST_DRIVER_EVENT_CONNECTED) {
         if (p.proto != HID_PROTOCOL_KEYBOARD && p.proto != HID_PROTOCOL_MOUSE) { return; }
+        const char *what = (p.proto == HID_PROTOCOL_MOUSE) ? "mouse" : "keyboard";
         const hid_host_device_config_t cfg = { .callback = hid_iface_cb, .callback_arg = (void *)p.proto };
-        hid_host_device_open(handle, &cfg);
+        esp_err_t eo = hid_host_device_open(handle, &cfg);
         // Boot protocol => fixed reports we know how to parse (kbd 8B / mouse 3B).
-        hid_class_request_set_protocol(handle, HID_REPORT_PROTOCOL_BOOT);
-        hid_host_device_start(handle);
+        esp_err_t ep = hid_class_request_set_protocol(handle, HID_REPORT_PROTOCOL_BOOT);
+        // None of these three used to be checked, and the "connected" line was
+        // printed whatever happened. hid_host_device_start() is the one that
+        // submits the interrupt IN transfer, so when it failed the device sat
+        // there enumerated and completely silent, with a log saying it was fine.
+        // That is the keyboard that is dead from the moment the board boots and
+        // comes back on a reset - it is a start that did not take, not a device
+        // that is not there.
+        //
+        // Low-speed devices are where it shows (the host controller warns about
+        // them by name at enumeration), so give the transfer a few tries with a
+        // moment in between rather than one and then silence.
+        esp_err_t es = ESP_FAIL;
+        for (int try_n = 0; try_n < 5; try_n++) {
+            es = hid_host_device_start(handle);
+            if (es == ESP_OK) break;
+            ets_printf("usb_kbd: %s start failed (0x%x), retry %d\n",
+                       what, (unsigned)es, try_n + 1);
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        if (eo != ESP_OK || ep != ESP_OK || es != ESP_OK) {
+            ets_printf("usb_kbd: %s open=0x%x proto=0x%x start=0x%x\n",
+                       what, (unsigned)eo, (unsigned)ep, (unsigned)es);
+        }
+        if (es != ESP_OK) {
+            ets_printf("usb_kbd: %s is enumerated but sending nothing - unplug it\n", what);
+            return;
+        }
         if (p.proto == HID_PROTOCOL_MOUSE) { hid_mouse_attach(); ets_printf("usb_kbd: mouse connected\n"); }
         else ets_printf("usb_kbd: keyboard connected\n");
     }

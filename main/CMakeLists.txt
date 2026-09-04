@@ -1,7 +1,7 @@
 idf_component_register(
-    SRCS "main.cpp" "dosio_sd.cpp" "platform_stubs.cpp" "lcd_st7789.cpp" "usb_kbd.cpp" "audio_i2s.cpp" "menu_disk.cpp" "bt_hid.cpp"
+    SRCS "main.cpp" "dosio_sd.cpp" "platform_stubs.cpp" "lcd_st7789.cpp" "usb_kbd.cpp" "audio_i2s.cpp" "menu_disk.cpp" "bt_hid.cpp" "usb_msc.cpp"
     INCLUDE_DIRS "."
-    REQUIRES np2kai esp_lcd esp_driver_spi espressif__arduino-esp32 fatfs sdmmc usb espressif__usb_host_hid esp_driver_i2s driver nvs_flash bt esp_hid
+    REQUIRES np2kai esp_lcd esp_driver_spi espressif__arduino-esp32 fatfs sdmmc usb espressif__usb_host_hid esp_driver_i2s driver nvs_flash bt esp_hid espressif__tinyusb
 )
 
 # Platform files include the np2kai core headers, so they need the SAME target

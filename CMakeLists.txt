@@ -9,3 +9,9 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 #    after this (a disabled warning is not re-enabled by `-Werror`). esp-modbus does this.
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error;-Wno-stringop-truncation;-Wno-stringop-overflow" APPEND)
 project(np2_espresso)
+
+# The raw tinyusb component finds tusb_config.h through its include path, and
+# main/ is not one of its dependencies. Inject it, rather than adding main/ to
+# every component's include path globally.
+idf_component_get_property(_tusb_lib espressif__tinyusb COMPONENT_LIB)
+target_include_directories(${_tusb_lib} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/main")

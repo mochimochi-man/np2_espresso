@@ -37,8 +37,20 @@ void lcd_blit(const uint8_t *fb);  // blit framebuffer -> panel (async, core 0)
 bool lcd_blit_busy(void);            // lcd_st7789.cpp: core-0 blit still reading fb
 void lcd_set_scale_mode(int m);      // lcd_st7789.cpp: 0=MAX 1=AVG 2=MID 3=1:1
 int  lcd_scale_mode_count(void);     // lcd_st7789.cpp: valid modes are 0..count-1
+// Which BIOS the machine boots with. 1 = BIOS_ESP.ROM (the compatible BIOS built
+// in pc98_bios_compat/), 0 = a real BIOS.ROM dumped from hardware. np2kai's
+// bios.c reads it when it loads the ROM, so a change only takes effect on the
+// next boot - the menu says as much, and its RESET row reboots.
+extern "C" char g_bios_file[40] = "";   // "" = the default name (/BIOS.ROM)
+
+// Same idea for the font ROM: 1 = FONT_ESP.ROM (built from Shinonome), 0 = a
+// real FONT.ROM. Applied at pccore_init like the BIOS, so it needs a reboot too.
+extern "C" char g_font_file[40] = "";   // "" = the default name (/FONT.ROM)
+
 void usb_kbd_init(void);           // usb_kbd.cpp: USB HID keyboard host
 void bt_hid_init(void);            // bt_hid.cpp: Bluetooth LE (HOGP) keyboard/mouse host
+bool usb_msc_boot_flag_take(void); // usb_msc.cpp: read+clear the "boot into USB Mode" flag
+void usb_msc_run(void);            // usb_msc.cpp: SD card reader over USB (never returns)
 int  usb_kbd_pop(uint8_t *nkey, uint8_t *down);  // drain one key event
 extern volatile int g_menu_req;      // usb_kbd.cpp: Pause/Break -> disk swap menu
 extern volatile int g_speed_req;     // menu_disk.cpp: CPU clock row -> new multiple (1..5)
@@ -49,6 +61,7 @@ void audio_write_s32(const int32_t *pcm, int frames);
 extern volatile int g_audio_peak;  // audio_i2s.cpp: max |sample| (>32767 = clipping)
 extern volatile int g_audio_drops; // audio_i2s.cpp: frames dropped (ring overflow)
 extern volatile int g_audio_under; // audio_i2s.cpp: ring-empty events (DAC underrun)
+extern volatile int g_audio_defus; // audio_i2s.cpp: audio time lost against the wall clock (us)
 extern volatile int g_np2_snd_gen;   // np2 sound.c: samples rendered (diag)
 extern volatile int g_np2_snd_skip;  // np2 sound.c: samples discarded, buffer full (diag)
 extern volatile int g_np2_snd_locks; // np2 sound.c: sound_pcmlock calls (diag)
@@ -187,6 +200,14 @@ extern "C" void app_main(void) {
     // comes up: by the time Arduino, the LCD and SD have taken their buffers,
     // the largest remaining block is far below that. bt_hid_init() checks the
     // block itself and skips Bluetooth rather than crashing if it is too small.
+    // --- USB Mode (SD card reader) --- chosen from the disk menu, which sets an
+    // NVS flag and reboots. Checked here, before anything else claims memory or
+    // the USB PHY: USB Mode runs no emulator, no Bluetooth and no arduino layer.
+    // The flag is cleared as it is read, so a replug/RESET returns to normal.
+    if (usb_msc_boot_flag_take()) {
+        usb_msc_run();                   // never returns
+    }
+
     bt_hid_init();
 
     // Silence the power-on/reboot speaker noise: the I2S pins float from reset
@@ -256,7 +277,28 @@ static void emu_task(void *arg) {
 #endif
     milstr_ncpy(np2cfg.biospath, "/", sizeof(np2cfg.biospath));
     file_setcd(np2cfg.biospath);
-    milstr_ncpy(np2cfg.fontfile, "/FONT.ROM", sizeof(np2cfg.fontfile));  // real EPSON T98-Next font on SD
+
+    {   // Which BIOS to boot with, as chosen in the menu. Read before
+        // pccore_init, which is where np2kai actually opens the ROM.
+        nvs_handle_t nh;
+        if (nvs_open("pc98", NVS_READONLY, &nh) == ESP_OK) {
+            uint8_t v;
+            (void)v;
+            size_t n = sizeof(g_bios_file);
+            if (nvs_get_str(nh, "biosfile", g_bios_file, &n) != ESP_OK) g_bios_file[0] = 0;
+            n = sizeof(g_font_file);
+            if (nvs_get_str(nh, "fontfile", g_font_file, &n) != ESP_OK) g_font_file[0] = 0;
+            nvs_close(nh);
+        }
+    }
+
+    // A ROM deleted from the card since it was chosen must not wedge the machine
+    // on a name that cannot be opened, so both fall back to the default here.
+    if (g_bios_file[0] && !sd_file_exists(g_bios_file)) g_bios_file[0] = 0;
+    if (g_font_file[0] && !sd_file_exists(g_font_file)) g_font_file[0] = 0;
+    milstr_ncpy(np2cfg.fontfile, g_font_file[0] ? g_font_file : "/FONT.ROM",
+                sizeof(np2cfg.fontfile));
+    printf("font file: %s\n", np2cfg.fontfile);
     // np2cfg.usebios (real /bios.rom vs np2's built-in emulated BIOS) is decided
     // below, once we know whether any disk is mounted — see the have_media block.
 
@@ -347,7 +389,7 @@ static void emu_task(void *arg) {
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     pccore_init();
     pccore_reset();
-    printf("BIOS ROM: %s\n", (pccore.rom & PCROM_BIOS) ? "real /bios.rom loaded" : "emulated (dummy BASIC)");
+    printf("BIOS ROM: %s\n", (pccore.rom & PCROM_BIOS) ? "loaded from SD" : "emulated (dummy BASIC)");
 
     // --- mount floppies (after pccore_reset). Load NOW (setup context) via
     //     readyfddex instead of the delayed setfdd: the delayed load runs inside
@@ -425,7 +467,9 @@ static void emu_task(void *arg) {
     int64_t  rt_t0 = esp_timer_get_time();     // wall baseline
     int64_t  rt_emu_us = 0;                     // accumulated emulated time (us)
     int64_t  acc_wait = 0;                      // perf: time spent throttled
-    int64_t  snd_owed = 0;                      // FM: audio samples owed (rate-matched drain)
+    int64_t  snd_acc = 0;                       // FM: audio owed, in sample*rt_hz units
+                                                // (see the drain below - the units keep
+                                                //  the truncation remainder)
     printf("realtime pacing ON: realclock=%u Hz\n", (unsigned)rt_hz);
     for (;;) {
         // Disk swap menu (Pause/Break): modal — pccore_exec pauses inside.
@@ -519,13 +563,30 @@ static void emu_task(void *arg) {
         // tempo is correct at any frame rate. (A fixed block/frame ran ~12% fast.)
         {
             int64_t s0 = esp_timer_get_time();
-            snd_owed += (int64_t)dcyc * FM_RATE / rt_hz;
-            for (int guard = 0; snd_owed >= g_fm_frames && guard < 8; guard++) {
+            // Carry the remainder. This used to be
+            //
+            //     snd_owed += dcyc * FM_RATE / rt_hz;
+            //
+            // which truncates every time round the loop - about four tenths of
+            // a sample per frame, and the emulator does not lose them: it
+            // renders from the CPU clock. The deficit backs up in np2's stream
+            // buffer until it is full, and sound_sync() then declines to render
+            // what will not fit (sound.c's streamprepare, counted as "skip" in
+            // the audio line below). That is a hole punched in the waveform
+            // about forty times a second. Percussive material masks it; a
+            // sustained low note does not, and it is heard as a buzz on the
+            // bass.
+            //
+            // Accumulating in sample*rt_hz units and subtracting whole blocks
+            // leaves the fraction in the accumulator, where it belongs.
+            snd_acc += (int64_t)dcyc * FM_RATE;
+            const int64_t block = (int64_t)g_fm_frames * rt_hz;
+            for (int guard = 0; snd_acc >= block && guard < 8; guard++) {
                 const SINT32 *pcm = sound_pcmlock();
                 if (!pcm) break;
                 audio_write_s32((const int32_t *)pcm, g_fm_frames);
                 sound_pcmunlock(pcm);
-                snd_owed -= g_fm_frames;
+                snd_acc -= block;
             }
             acc_snd += esp_timer_get_time() - s0;
         }
@@ -570,10 +631,15 @@ static void emu_task(void *arg) {
 #endif
 #if ENABLE_FM_SOUND
             // audio peak: >32767 => the mix clips (buzz). Reset each window.
-            printf("  audio: peak=%d drops=%d under=%d | gen=%d skip=%d locks=%d\n",
-                   g_audio_peak, g_audio_drops, g_audio_under,
+            // def: how far the sound handed to the DAC fell behind the wall clock
+            // during a continuous run - i.e. how much silence the DAC filled in.
+            // Under 46ms it came out of the DMA's own buffer; past that it is a
+            // hole in the output, and that is what a click is.
+            printf("  audio: peak=%d drops=%d under=%d def=%dus | gen=%d skip=%d locks=%d\n",
+                   g_audio_peak, g_audio_drops, g_audio_under, g_audio_defus,
                    g_np2_snd_gen, g_np2_snd_skip, g_np2_snd_locks);
             g_audio_peak = 0; g_audio_drops = 0; g_audio_under = 0;
+            g_audio_defus = 0;
             g_np2_snd_gen = 0; g_np2_snd_skip = 0; g_np2_snd_locks = 0;
             int nfr = 300;
             printf("  phases/frame: loop=%dus cb=%dus sndsync=%dus draw=%dus\n",

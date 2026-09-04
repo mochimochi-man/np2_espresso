@@ -10,7 +10,9 @@ modifications and customizations to run on the ESP32.
 ## Required hardware
 
 - ESP32-S3 N16R8 Devkit
-- LCD ST7789 TFT 240x320 module
+- An LCD module, either:
+  - **ST7789 TFT 240x320**
+  - **ST7796 TFT 320x480** (its RESET pin has to be wired - GPIO13)
 - DAC MAX98357A I2S module
 - microSD card reader (SPI) module
 - microSD card, 32GB or less, formatted as FAT32
@@ -24,7 +26,7 @@ modifications and customizations to run on the ESP32.
 
 - ESP-IDF v5.5 series
 - `BIOS.ROM` / `SOUND.ROM` / `FONT.ROM` extracted from real PC-9801 hardware.
-  Place them in the root of the microSD card.
+  Place them in the root of the microSD card. A compatible BIOS is bundled as well.
 - Disk images such as `.NFD` or `.NHD`. Place them in the root of the microSD card.
 
 ## Wiring
@@ -138,18 +140,38 @@ one in over USB.
 
 - Press **Pause/Break** to open the menu. **F11** and **F12** open it too, for the
   many keyboards (Bluetooth ones especially) that have no Pause key.
-- From the menu you can mount FDD1/FDD2/HDD disk images, change the CPU priority,
-  switch the downscaling algorithm, and set the **LCD SPI clock** and the
-  **LCD colour depth**.
+- From the menu you can mount FDD1/FDD2/HDD disk images, create a blank disk image,
+  change the CPU priority, switch the downscaling algorithm, set the LCD SPI clock,
+  and more.
+- The rows that hold a value — **CPU clock**, **DISP**, **LCD SPI** and
+  **LCD color** — also take the **left and right arrows**. The arrows step one
+  either way and stop at the ends; **RET** steps up and wraps round at the top.
+  Keypad **4** / **6** do the same, matching keypad **8** / **2** for moving up
+  and down.
+- **DISP**: the attached panel and the downscaler, shown together as e.g.
+  ST7789/AVG. One firmware drives either an **ST7789 240x320** or an
+  **ST7796 320x480**; changing the panel needs a RESET. ST7796 has no 12-bit
+  pixel format, so RGB565 is used automatically while it is selected.
+- **BIOS** / **FONT**: pick any BIOS*.ROM / FONT*.ROM from the microSD root.
+  Rename a BIOS dumped from real hardware to `BIOS.ROM`, and a font ROM dumped from
+  real hardware to `FONT.ROM`.
+  A ROM dumped from real hardware and a compatible one can sit side by side and
+  be swapped from here; the change needs a RESET.
 - **LCD SPI**: 80 / 40 / 20 MHz (40MHz by default). Lower it if the display is
   corrupted. ST7789 emulators such as LcdTap in particular can break up at 40MHz
   on busy screens (games) while looking fine on menus - choose 20MHz for those.
 - **LCD color**: RGB444 (12-bit, the default) or RGB565 (16-bit). RGB444 sends
   three quarters of the bytes per pixel, so drawing is faster. Choose RGB565 if the
   reduced colour depth bothers you.
+- **USB Mode after reboot**: restarts the board and presents the microSD to a PC as
+  **USB mass storage** — a removable drive over the one USB cable, no drivers, so disk
+  images can be dragged on and off from Explorer or Finder. It lasts for that one
+  boot: **replug the USB cable or press RESET and the emulator comes back**. The
+  emulator does not run meanwhile, because the PC writes raw sectors and the board
+  cannot keep the card mounted at the same time.
 - Settings are stored on the board and survive a power cycle.
-- Raising the CPU priority lowers the graphics-rendering priority. If graphics
-  rendering is affected, try lowering the CPU priority.
+- **CPU clock**: raising the CPU priority lowers the graphics-rendering priority.
+  If graphics rendering is affected, try lowering the CPU priority.
 - Press **ESC**, or select **RESET**, to save the current state and leave the menu.
 
 ## License

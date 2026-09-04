@@ -1,4 +1,8 @@
-// ST7789 LCD output for the PC-98 framebuffer, on ESP-IDF's native esp_lcd.
+// ST7796 LCD output for the PC-98 framebuffer, on ESP-IDF's native esp_lcd.
+//
+// Forked from the ST7789 build. The SPI wiring is shared (MOSI 11 / SCLK 12 /
+// CS 10 / DC 9 on SPI3) because the two modules are hooked up the same way apart
+// from RESET, which the ST7789 board left unconnected and this one needs.
 //
 // This replaces the vendored TFT_eSPI. Only the transport (esp_lcd_panel_io_spi)
 // comes from the IDF: the panel init sequence, the address window and the pixel
@@ -18,6 +22,7 @@
 
 #include <string.h>
 
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_heap_caps.h"
@@ -45,17 +50,37 @@ extern "C" int ets_printf(const char *fmt, ...);
 #define PIN_SCLK        12
 #define PIN_CS          10
 #define PIN_DC           9
+// ST7796 modules bring RESET out and want a real pulse; the ST7789 board tied it
+// off. Set to -1 if yours is strapped high.
+#define PIN_RST         13
 // RST and MISO are not wired on this module; BL goes straight to 3.3V.
 
 // Source = the PSRAM framebuffer (platform_stubs.cpp: PC98_W x PC98_H).
 #define SRC_W    640
 #define SRC_H    480                 // framebuffer height (640x400 active + slack)
-#define DST_W    320                 // 640 / 2  (whole width shown)
-#define DST_H    200                 // 400 / 2
+#define PC98_H   400                 // the active PC-98 screen inside it
+// Destination size, per panel. 640x400 halves exactly onto a 320x240 panel; on
+// the 480x320 one that would waste most of the glass, so it is scaled by 3/4
+// instead and very nearly fills it. Both are computed at init into s_dst_*.
+#define DST_W_MAX 480                // biggest destination width (buffer sizing)
+#define DST_H_MAX 300
+static int s_dst_w = 320, s_dst_h = 200;
 
 // Native panel resolution, and the landscape size after MADCTL rotation.
-#define PANEL_NATIVE_W  240
-#define PANEL_NATIVE_H  320
+// Panel table. Both modules share the SPI wiring; RESET is only brought out on
+// the ST7796 one. Native portrait size - the landscape figures are these swapped.
+#define PANEL_ST7789  0
+#define PANEL_ST7796  1
+#define PANEL_COUNT   2
+static const struct {
+    const char *name;
+    int  w, h;          // native (portrait)
+    bool has_rgb444;    // ST7796's COLMOD offers 65K/262K only - no 12-bit at all
+} s_panels[PANEL_COUNT] = {
+    { "ST7789", 240, 320, true  },
+    { "ST7796", 320, 480, false },
+};
+static int s_panel = PANEL_ST7789;   // overridden from NVS in lcd_load_nvs()
 
 // One SPI transfer per band rather than per row: fewer transactions is faster.
 // The size is bounded by INTERNAL DMA memory, the scarcest resource on this
@@ -72,7 +97,7 @@ static esp_lcd_panel_io_handle_t s_io = nullptr;
 static uint16_t *s_img = nullptr;    // 320x200 downscaled frame (PSRAM, native order)
 static uint8_t  *s_band[2] = { nullptr, nullptr };
 static int       s_band_cur = 0;
-static int s_pan_w = PANEL_NATIVE_H, s_pan_h = PANEL_NATIVE_W;   // after rotation
+static int s_pan_w = 320, s_pan_h = 240;   // landscape, set from the table at init
 
 // ---- async blit: core 0 worker ----------------------------------------------
 // lcd_blit() only hands the framebuffer pointer to a core-0 task (notify) and
@@ -126,19 +151,49 @@ static inline void cmd1(uint8_t c, uint8_t a) { esp_lcd_panel_io_tx_param(s_io, 
 // is what this module needs to show red as red. Inversion stays OFF - this is a
 // non-inverted panel (the same choice TFT_eSPI was configured with here).
 static void panel_init(void) {
+    const bool is96 = (s_panel == PANEL_ST7796);
+#if PIN_RST >= 0
+    // Hardware reset first: some ST7796 modules ignore SWRESET until they have
+    // seen a real RESET pulse after power-up.
+    gpio_set_direction((gpio_num_t)PIN_RST, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level((gpio_num_t)PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(120));
+#endif
     cmd(0x01);                            // SWRESET
     vTaskDelay(pdMS_TO_TICKS(150));
     cmd(0x11);                            // SLPOUT
     vTaskDelay(pdMS_TO_TICKS(120));
+    // ST7796 keeps most of its registers behind a command-set lock. Plenty of
+    // modules come up blank until it is opened, so unlock, then close it again.
+    if (is96) {
+        cmd1(0xf0, 0xc3);                 // CSCON: enable command set 2
+        cmd1(0xf0, 0x96);
+        cmd1(0xb4, 0x01);                 // inversion control: 1-dot inversion
+        cmd1(0xf0, 0x3c);                 // CSCON: lock again
+        cmd1(0xf0, 0x69);
+    }
     // MADCTL MV|MX = 320x240 landscape. The BGR bit stays CLEAR: with it set, the
     // panel reads our RGB565 as BGR and red and blue trade places - visible as a
     // yellow menu cursor turning cyan, and on the emulator screen too (a DOS text
     // screen just does not show it). TFT_eSPI's CONFIG_TFT_BGR_ORDER=y is not the
     // same statement: that library also flips the order it writes.
-    cmd1(0x36, 0x60);                     // MADCTL: MV|MX, RGB order
+    // BGR bit SET here, unlike the ST7789 build: with it clear the bring-up red
+    // fill came out blue, i.e. the panel reads our RGB565 the other way round.
+    // MX dropped: with it set the picture came out mirrored left to right. If a
+    // future panel comes up upside-down instead, the other single-axis flip from
+    // here is 0xE8 (MV|MX|MY|BGR).
+    // Orientation and colour order differ per module: the ST7789 board here wants
+    // MV|MX with RGB order, the ST7796 one MV with BGR (its red came out blue and
+    // its picture mirrored until MX went away).
+    cmd1(0x36, is96 ? 0xe8 : 0x60);       // MADCTL
     cmd1(0x3A, 0x55);                     // COLMOD: start in 16 bit
     s_panel12 = 0;
-    cmd(0x21);                            // INVON (CONFIG_TFT_INVERSION_ON=y)
+    // ST7796 panels are normally NOT inverted, unlike the ST7789 module this was
+    // forked from. If the picture comes out as a negative, use 0x21 (INVON).
+    // The ST7789 module is an inverted panel, the ST7796 one is not.
+    cmd(is96 ? 0x20 : 0x21);              // INVOFF / INVON
     cmd(0x13);                            // NORON
     vTaskDelay(pdMS_TO_TICKS(10));
     cmd(0x29);                            // DISPON
@@ -173,12 +228,31 @@ extern "C" void lcd_set_spi_idx(int i) {
 // value used when NVS holds no choice yet - the menu's setting is persisted and
 // wins (some displays, notably an ST7789 *emulator* rather than the real
 // controller, garble 12-bit pixels and must be able to stay on RGB565).
+// ST7796 has no 12-bit pixel format at all - its COLMOD only offers 65K and 262K
+// colours, unlike the ST7789 this was forked from. Asking for 0x53 left the panel
+// showing nothing while 16-bit fills worked, which is what a blank emulator screen
+// over a working red test fill looked like. Which panel is attached is a runtime
+// choice, though, so that is a reason to refuse 12-bit on the ST7796 - not to
+// build it out for both: s_panels[].has_rgb444 says which is which, and it is
+// what lcd_load_nvs() and lcd_set_rgb444() below both go by.
 #define RGB444_DEFAULT 1
 static volatile int s_rgb444 = RGB444_DEFAULT;
 
 extern "C" int  lcd_get_rgb444(void) { return s_rgb444; }
 
+extern "C" int  lcd_get_panel(void)   { return s_panel; }
+extern "C" int  lcd_panel_count(void) { return PANEL_COUNT; }
+extern "C" const char *lcd_panel_name(void) { return s_panels[s_panel].name; }
+// Takes effect on the next boot: the init sequence, the geometry and the buffers
+// are all fixed at lcd_init() time. The menu row says so.
+extern "C" void lcd_set_panel(int p) {
+    if (p >= 0 && p < PANEL_COUNT) s_panel = p;
+}
+
 extern "C" void lcd_set_rgb444(int on) {
+    if (!s_panels[s_panel].has_rgb444) {
+        return;                            // ST7796: no 12-bit format to switch to
+    }
     on = on ? 1 : 0;
     if (on == s_rgb444) return;
     s_rgb444 = on;
@@ -196,7 +270,12 @@ static void lcd_load_nvs(void) {
     if (nvs_open("pc98", NVS_READONLY, &nh) != ESP_OK) return;
     uint8_t v;
     if (nvs_get_u8(nh, "spiidx", &v) == ESP_OK && v < SPI_MHZ_COUNT) s_spi_idx = v;
+    if (nvs_get_u8(nh, "panel", &v) == ESP_OK && v < PANEL_COUNT) s_panel = v;
     if (nvs_get_u8(nh, "rgb444", &v) == ESP_OK) s_rgb444 = v ? 1 : 0;
+    // A panel without a 12-bit format shows nothing at all when asked for one,
+    // and the menu that would let you change it back is drawn the same way - so
+    // the stored choice cannot be honoured here.
+    if (!s_panels[s_panel].has_rgb444) s_rgb444 = 0;
     nvs_close(nh);
 }
 
@@ -348,11 +427,15 @@ extern "C" bool lcd_init(void) {
     }
 
     panel_init();
-    s_pan_w = PANEL_NATIVE_H;                // rotated: 320 x 240
-    s_pan_h = PANEL_NATIVE_W;
+    s_pan_w = s_panels[s_panel].h;           // landscape = native size swapped
+    s_pan_h = s_panels[s_panel].w;
+    // Largest whole-screen reduction that still fits, in quarters: 2:1 for a
+    // 320x240 panel, 3:4 for a 480x320 one.
+    if (s_pan_h >= 300 && s_pan_w >= 480) { s_dst_w = 480; s_dst_h = 300; }
+    else                                  { s_dst_w = 320; s_dst_h = 200; }
     fill_rect(0, 0, s_pan_w, s_pan_h, 0x0000);
 
-    s_img = (uint16_t *)heap_caps_malloc((size_t)DST_W * DST_H * 2,
+    s_img = (uint16_t *)heap_caps_malloc((size_t)DST_W_MAX * DST_H_MAX * 2,
                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ets_printf("lcd: esp_lcd ST7789 init OK, size=%dx%d, spi=%dMHz, color=%s\n",
                s_pan_w, s_pan_h, s_spi_mhz[s_spi_idx], s_rgb444 ? "RGB444" : "RGB565");
@@ -428,29 +511,44 @@ static void do_blit(const uint8_t *fb) {
 
     if (!s_img) return;
     const uint16_t *src = (const uint16_t *)fb;
-    for (int dy = 0; dy < DST_H; dy++) {
-        const uint16_t *r0 = src + (dy * 2) * SRC_W;
-        const uint16_t *r1 = r0 + SRC_W;
-        uint16_t *d = s_img + dy * DST_W;
-        const int mode = s_scale_mode;
-        for (int dx = 0; dx < DST_W; dx++) {
-            int sx = dx * 2;
-            uint16_t p00 = r0[sx], p01 = r0[sx + 1], p10 = r1[sx], p11 = r1[sx + 1];
+    const int mode = s_scale_mode;
+    // Box filter over whatever ratio the panel asks for. The old code assumed a
+    // fixed 2x2 block, which is why a 480x320 panel still got a 320x200 picture
+    // in the middle of a lot of black: the ratio has to follow s_dst_*.
+    for (int dy = 0; dy < s_dst_h; dy++) {
+        const int sy0 = dy * PC98_H / s_dst_h;
+        int sy1 = (dy + 1) * PC98_H / s_dst_h;
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        uint16_t *d = s_img + dy * s_dst_w;
+        for (int dx = 0; dx < s_dst_w; dx++) {
+            const int sx0 = dx * SRC_W / s_dst_w;
+            int sx1 = (dx + 1) * SRC_W / s_dst_w;
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            uint32_t rs = 0, gs = 0, bs = 0, cnt = 0;
+            uint16_t mn = 0xffff, mx = 0;
+            for (int sy = sy0; sy < sy1; sy++) {
+                const uint16_t *r = src + sy * SRC_W;
+                for (int sx = sx0; sx < sx1; sx++) {
+                    uint16_t p = r[sx];
+                    rs += (p >> 11) & 31; gs += (p >> 5) & 63; bs += p & 31;
+                    cnt++;
+                    if (p < mn) mn = p;
+                    if (p > mx) mx = p;
+                }
+            }
             uint16_t out;
             if (mode == SCALE_AVG) {
-                out = avg4(p00, p01, p10, p11);
+                out = (uint16_t)(((rs / cnt) << 11) | ((gs / cnt) << 5) | (bs / cnt));
+            } else if (mode == SCALE_MID) {
+                out = avg2(mn, mx);
             } else {
-                uint16_t mn = p00, mx = p00;
-                if (p01 < mn) mn = p01; else mx = p01;
-                if (p10 < mn) mn = p10; else if (p10 > mx) mx = p10;
-                if (p11 < mn) mn = p11; else if (p11 > mx) mx = p11;
-                out = (mode == SCALE_MID) ? avg2(mn, mx) : mx;
+                out = mx;
             }
             d[dx] = out;
         }
     }
-    const int x0 = (s_pan_w - DST_W) / 2, y0 = (s_pan_h - DST_H) / 2;
-    push_rect(x0, y0, DST_W, DST_H, s_img, DST_W, s_rgb444);
+    const int x0 = (s_pan_w - s_dst_w) / 2, y0 = (s_pan_h - s_dst_h) / 2;
+    push_rect(x0, y0, s_dst_w, s_dst_h, s_img, s_dst_w, s_rgb444);
 }
 
 // ---- disk-menu text UI (menu_disk.cpp). Drawn on core 1 while the emulator is
@@ -475,7 +573,7 @@ extern "C" void lcd_menu_clear(void) {
 extern "C" void lcd_menu_line(int row, const char *s, uint16_t fg, uint16_t bg) {
     if (!s || row < 0 || (row + 1) * MENU_ROW_H > s_pan_h) return;
     if (!s_band[0] || !s_img) return;
-    const int w = (s_pan_w > DST_W) ? DST_W : s_pan_w;
+    const int w = (s_pan_w > DST_W_MAX) ? DST_W_MAX : s_pan_w;
     const int cols = w / MENU_CH_W;
     // Render the whole row into the (idle) downscale buffer and push it in one
     // go: the emulator is paused, so s_img is free, and one transfer per row
