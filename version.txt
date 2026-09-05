@@ -4,6 +4,7 @@ build 20260814 LCD SPI clock selectable (40MHz default) and RGB444 output.
 build 20260816 Bluetooth LE keyboard/mouse support.
 build 20260817 TFT_eSPI replaced by ESP-IDF native esp_lcd.
 build 20260820 ST7796 panel support, ROM file selection from the menu.
-build 20260905 USB Mode added(microSD as a USB mass storage device).
+build 20260905 USB Mode dropped. hard to use.
+               Built-in compatible BIOS and font added.
                FM sound fixed.
                USB keyboard fixed. it sometimes coming up dead.

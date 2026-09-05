@@ -158,12 +158,6 @@ one in over USB.
 - **LCD color**: RGB444 (12-bit, the default) or RGB565 (16-bit). RGB444 sends
   three quarters of the bytes per pixel, so drawing is faster. Choose RGB565 if the
   reduced colour depth bothers you.
-- **USB Mode after reboot**: restarts the board and presents the microSD to a PC as
-  **USB mass storage** — a removable drive over the one USB cable, no drivers, so disk
-  images can be dragged on and off from Explorer or Finder. It lasts for that one
-  boot: **replug the USB cable or press RESET and the emulator comes back**. The
-  emulator does not run meanwhile, because the PC writes raw sectors and the board
-  cannot keep the card mounted at the same time.
 - Settings are stored on the board and survive a power cycle.
 - **CPU clock**: raising the CPU priority lowers the graphics-rendering priority.
   If graphics rendering is affected, try lowering the CPU priority.

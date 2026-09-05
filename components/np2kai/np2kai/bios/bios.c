@@ -457,12 +457,30 @@ void bios_initialize(void) {
 			   so a compatible ROM and one dumped from real hardware can both
 			   live on the card. getbiospath() prepends the BIOS directory, so
 			   the leading slash is skipped here. */
-			getbiospath(path, (const OEMCHAR *)(g_bios_file + (g_bios_file[0] == 0x2f ? 1 : 0)),
-			            NELEMENTS(path));
+			if (g_bios_file[0] == 0x3a) {
+				/* ":builtin/..." - the ROM inside the firmware, which the menu
+				   offers alongside the files on the card. It is not on any
+				   volume, so getbiospath() must not put a directory in front
+				   of it; dosio_sd.cpp knows the name. */
+				OEMSPRINTF(path, OEMTEXT("%s"), (const OEMCHAR *)g_bios_file);
+			} else {
+				getbiospath(path, (const OEMCHAR *)(g_bios_file + (g_bios_file[0] == 0x2f ? 1 : 0)),
+				            NELEMENTS(path));
+			}
 			fh = file_open_rb(path);
 		}
 		if (fh == FILEH_INVALID) {
 			getbiospath(path, str_biosrom, NELEMENTS(path));
+			fh = file_open_rb(path);
+		}
+		if (fh == FILEH_INVALID) {
+			/* Neither the ROM the menu names nor a bios.rom on the card, so
+			   fall back to the compatible BIOS built into the firmware. Last,
+			   deliberately: a board that has always had a dumped ROM on its
+			   card must keep booting from it, and this only has to cover the
+			   case where there is nothing at all. dosio_sd.cpp serves this
+			   path out of flash. */
+			OEMSPRINTF(path, OEMTEXT("%s"), OEMTEXT(":builtin/BIOS.ROM"));
 			fh = file_open_rb(path);
 		}
 		if (fh != FILEH_INVALID) {

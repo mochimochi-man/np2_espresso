@@ -33,7 +33,16 @@ extern "C" {
 extern "C" int ets_printf(const char *fmt, ...);
 
 // Concrete handle: dosio.h did `typedef RFILE * FILEH;`
-struct RFILE { int fd; };
+// fd < 0 means the handle is a ROM built into the firmware rather than a file
+// on the card - see builtin_lookup(). Everything above this layer opens a path
+// and reads it, and whether that path is on the SD or in flash is not its
+// business, so the blob is served through the same FILEH.
+struct RFILE {
+    int fd;
+    const uint8_t *blob;
+    size_t blob_len;
+    size_t blob_pos;
+};
 
 #ifndef OEMPATHDIVC
 #define OEMPATHDIVC '/'
@@ -187,9 +196,53 @@ void dosio_init(void) {
 }
 void dosio_term(void) {}
 
+// ---- ROMs built into the firmware ----------------------------------------
+// A compatible BIOS and a font are linked into the image and offered here as
+// read-only files, so a board with a blank card still comes up. Doing it at
+// this layer rather than in np2kai means nothing above has to know, and the
+// menu's ROM switching keeps working unchanged - it just names a real file
+// instead, and a real file wins.
+//
+// The names cannot collide with anything on the card: no SD path starts with
+// a colon.
+#define BUILTIN_BIOS ":builtin/BIOS.ROM"
+#define BUILTIN_FONT ":builtin/FONT.ROM"
+
+extern const uint8_t builtin_bios_start[] asm("_binary_BIOS_ESP_ROM_start");
+extern const uint8_t builtin_bios_end[]   asm("_binary_BIOS_ESP_ROM_end");
+extern const uint8_t builtin_font_start[] asm("_binary_FONT_ESP_ROM_start");
+extern const uint8_t builtin_font_end[]   asm("_binary_FONT_ESP_ROM_end");
+
+static const uint8_t *builtin_lookup(const char *path, size_t *len) {
+    if (!path) {
+        return nullptr;
+    }
+    if (!strcmp(path, BUILTIN_BIOS)) {
+        *len = (size_t)(builtin_bios_end - builtin_bios_start);
+        return builtin_bios_start;
+    }
+    if (!strcmp(path, BUILTIN_FONT)) {
+        *len = (size_t)(builtin_font_end - builtin_font_start);
+        return builtin_font_start;
+    }
+    return nullptr;
+}
+
 // ---- open / create ----
 // Reads/writes of existing files go through the persistent cache (see above).
 static FILEH open_cached(const OEMCHAR *path) {
+    {   // a built-in ROM? Then there is no file and no SD access at all.
+        size_t blen = 0;
+        const uint8_t *blob = builtin_lookup((const char *)path, &blen);
+        if (blob) {
+            RFILE *h = new RFILE();
+            h->fd = -1;
+            h->blob = blob;
+            h->blob_len = blen;
+            h->blob_pos = 0;
+            return (FILEH)h;
+        }
+    }
     char full[MAX_PATH + 8];
     map_path(full, sizeof(full), path);
     int fd = cache_open(full);
@@ -216,6 +269,15 @@ FILEH file_create(const OEMCHAR *path)  {
 FILEPOS file_seek(FILEH handle, FILEPOS pointer, int method) {
     RFILE *h = (RFILE *)handle;
     if (!h) return 0;
+    if (h->fd < 0) {
+        long p = (method == FSEEK_CUR) ? (long)h->blob_pos + pointer
+               : (method == FSEEK_END) ? (long)h->blob_len + pointer
+                                       : (long)pointer;
+        if (p < 0) p = 0;
+        if (p > (long)h->blob_len) p = (long)h->blob_len;
+        h->blob_pos = (size_t)p;
+        return (FILEPOS)p;
+    }
     int w = (method == FSEEK_CUR) ? SEEK_CUR : (method == FSEEK_END) ? SEEK_END : SEEK_SET;
     IoReq r{}; r.op = IOP_SEEK; r.fd = h->fd; r.off = pointer; r.whence = w;
     long res = io_call(r);
@@ -224,6 +286,13 @@ FILEPOS file_seek(FILEH handle, FILEPOS pointer, int method) {
 UINT file_read(FILEH handle, void *data, UINT length) {
     RFILE *h = (RFILE *)handle;
     if (!h) return 0;
+    if (h->fd < 0) {
+        size_t left = h->blob_len - h->blob_pos;
+        size_t n = (length < left) ? length : left;
+        memcpy(data, h->blob + h->blob_pos, n);
+        h->blob_pos += n;
+        return (UINT)n;
+    }
     UINT done = 0;
     while (done < length) {
         IoReq r{}; r.op = IOP_READ; r.fd = h->fd;
@@ -245,6 +314,10 @@ UINT file_write(FILEH handle, const void *data, UINT length) {
 short file_close(FILEH handle) {
     RFILE *h = (RFILE *)handle;
     if (!h) return -1;
+    if (h->fd < 0) {                    // a built-in ROM: nothing to close
+        delete h;
+        return 0;
+    }
     if (!cache_owns(h->fd)) {           // keep cached fds open
         IoReq r{}; r.op = IOP_CLOSE; r.fd = h->fd; io_call(r);
     }
@@ -254,6 +327,7 @@ short file_close(FILEH handle) {
 FILELEN file_getsize(FILEH handle) {
     RFILE *h = (RFILE *)handle;
     if (!h) return 0;
+    if (h->fd < 0) return (FILELEN)h->blob_len;
     IoReq r{}; r.op = IOP_FSIZE; r.fd = h->fd;
     long sz = io_call(r);
     return (FILELEN)(sz < 0 ? 0 : sz);

@@ -130,7 +130,6 @@ static int  s_count;
 #define ROMNAME_LEN 40             // main.cpp sizes the buffers to match
 extern "C" char g_bios_file[ROMNAME_LEN];   // "" = the built-in default
 extern "C" char g_font_file[ROMNAME_LEN];
-extern "C" void usb_msc_request(void);   // usb_msc.cpp: arm the USB Mode boot flag
 static void save_settings(void);   // defined below; used by the HDD-eject reboot
 
 static const char *drv_label(int d) {
@@ -214,11 +213,10 @@ static void draw_drives(int sel) {
         snprintf(line, sizeof(line), "%s RESET (save & reboot)", sel == 10 ? ">" : " ");
         lcd_menu_line(12, line, sel == 10 ? COL_BLACK : COL_WHITE,
                       sel == 10 ? COL_YELLOW : COL_BLACK);
-        // Reboot into the SD card reader (usb_msc.cpp). One-shot: the flag is
-        // consumed at boot, so replugging USB comes back as the emulator.
-        snprintf(line, sizeof(line), "%s USB Mode after reboot", sel == 11 ? ">" : " ");
-        lcd_menu_line(13, line, sel == 11 ? COL_BLACK : COL_WHITE,
-                      sel == 11 ? COL_YELLOW : COL_BLACK);
+        // No USB mass storage mode on this board. The ESP32-S3 has one USB
+        // peripheral, and the keyboard is already using it as a host - so a card
+        // reader can only exist by unplugging the keyboard for the duration,
+        // which is not a feature anyone would use twice.
     }
 }
 
@@ -285,12 +283,15 @@ static void browse_rom(int which) {
     const char *prefix = which ? "FONT" : "BIOS";
     char *dst = which ? g_font_file : g_bios_file;
     scan_roms(prefix);
-    lcd_menu_clear();
-    if (s_count == 0) {
-        lcd_menu_line(2, "  no ROM on SD", COL_WHITE, COL_BLACK);
-        vTaskDelay(pdMS_TO_TICKS(1200));
-        return;
-    }
+    // The ROM built into the firmware is offered alongside whatever is on the
+    // card, as the first entry. It is not a file, so scan_roms() cannot find it,
+    // and without a row here there is no way to ask for it once a card carrying
+    // a ROM is in the slot - which is every card that has ever worked.
+    //
+    // dosio_sd.cpp answers these two paths out of flash; everything between here
+    // and there treats them as ordinary filenames.
+    const char *const builtin = which ? ":builtin/FONT.ROM" : ":builtin/BIOS.ROM";
+    const int total = s_count + 1;
     int sel = 0, top = 0;
     for (;;) {
         lcd_menu_clear();
@@ -298,10 +299,12 @@ static void browse_rom(int which) {
         snprintf(hdr, sizeof(hdr), "  select %s ROM (needs RESET)", prefix);
         lcd_menu_line(0, hdr, COL_YELLOW, COL_BLACK);
         for (int r = 0; r < VISIBLE; r++) {
-            int idx = top + r;
-            if (idx >= s_count) break;
+            const int idx = top + r;
+            if (idx >= total) break;
             char line[80];
-            snprintf(line, sizeof(line), "%s %.38s", idx == sel ? ">" : " ", s_names[idx]);
+            snprintf(line, sizeof(line), "%s %.38s", idx == sel ? ">" : " ",
+                     idx == 0 ? (which ? "(built-in font)" : "(built-in compatible BIOS)")
+                              : s_names[idx - 1]);
             lcd_menu_line(2 + r, line, idx == sel ? COL_BLACK : COL_WHITE,
                           idx == sel ? COL_YELLOW : COL_BLACK);
         }
@@ -312,11 +315,11 @@ static void browse_rom(int which) {
         }
         if (nk == NK_ESC) return;
         if (key_is_up(nk)   && sel > 0)            sel--;
-        if (key_is_down(nk) && sel < s_count - 1)  sel++;
+        if (key_is_down(nk) && sel < total - 1)    sel++;
         if (sel < top) top = sel;
         if (sel >= top + VISIBLE) top = sel - VISIBLE + 1;
         if (nk == NK_RET) {
-            snprintf(dst, ROMNAME_LEN, "%s", s_names[sel]);
+            snprintf(dst, ROMNAME_LEN, "%s", sel == 0 ? builtin : s_names[sel - 1]);
             ets_printf("menu: %s ROM <- %s\n", prefix, dst);
             return;
         }
@@ -523,7 +526,7 @@ extern "C" void menu_disk_run(void) {
         if (!dn) continue;
         if (nk == NK_ESC) break;
         if (key_is_up(nk)   && sel > 0) sel--;
-        if (key_is_down(nk) && sel < 11) sel++;
+        if (key_is_down(nk) && sel < 10) sel++;
         // The value rows take the arrows too, stopping at the ends.
         if (sel >= 4 && sel <= 7) {
             const int dir = key_is_right(nk) ? 1 : (key_is_left(nk) ? -1 : 0);
@@ -540,13 +543,6 @@ extern "C" void menu_disk_run(void) {
                 browse_rom(1);
             } else if (sel == 10) {             // RESET: persist the settings, reboot
                 save_settings();
-                esp_restart();
-            } else if (sel == 11) {             // USB Mode: arm the flag, reboot
-                save_settings();
-                usb_msc_request();
-                lcd_menu_clear();
-                lcd_menu_line(2, "  rebooting as card reader...", COL_WHITE, COL_BLACK);
-                vTaskDelay(pdMS_TO_TICKS(800));
                 esp_restart();
             } else {
                 browse(sel);                    // sel 0/1/2 = FDD1/FDD2/HDD

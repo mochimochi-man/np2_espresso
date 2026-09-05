@@ -49,8 +49,6 @@ extern "C" char g_font_file[40] = "";   // "" = the default name (/FONT.ROM)
 
 void usb_kbd_init(void);           // usb_kbd.cpp: USB HID keyboard host
 void bt_hid_init(void);            // bt_hid.cpp: Bluetooth LE (HOGP) keyboard/mouse host
-bool usb_msc_boot_flag_take(void); // usb_msc.cpp: read+clear the "boot into USB Mode" flag
-void usb_msc_run(void);            // usb_msc.cpp: SD card reader over USB (never returns)
 int  usb_kbd_pop(uint8_t *nkey, uint8_t *down);  // drain one key event
 extern volatile int g_menu_req;      // usb_kbd.cpp: Pause/Break -> disk swap menu
 extern volatile int g_speed_req;     // menu_disk.cpp: CPU clock row -> new multiple (1..5)
@@ -200,13 +198,6 @@ extern "C" void app_main(void) {
     // comes up: by the time Arduino, the LCD and SD have taken their buffers,
     // the largest remaining block is far below that. bt_hid_init() checks the
     // block itself and skips Bluetooth rather than crashing if it is too small.
-    // --- USB Mode (SD card reader) --- chosen from the disk menu, which sets an
-    // NVS flag and reboots. Checked here, before anything else claims memory or
-    // the USB PHY: USB Mode runs no emulator, no Bluetooth and no arduino layer.
-    // The flag is cleared as it is read, so a replug/RESET returns to normal.
-    if (usb_msc_boot_flag_take()) {
-        usb_msc_run();                   // never returns
-    }
 
     bt_hid_init();
 
@@ -294,9 +285,18 @@ static void emu_task(void *arg) {
 
     // A ROM deleted from the card since it was chosen must not wedge the machine
     // on a name that cannot be opened, so both fall back to the default here.
-    if (g_bios_file[0] && !sd_file_exists(g_bios_file)) g_bios_file[0] = 0;
-    if (g_font_file[0] && !sd_file_exists(g_font_file)) g_font_file[0] = 0;
-    milstr_ncpy(np2cfg.fontfile, g_font_file[0] ? g_font_file : "/FONT.ROM",
+    // A ":builtin/..." choice is not on the card and never goes missing, so it
+    // is exempt from the test - without this it would be cleared on every boot
+    // and the built-in ROM could be selected but never used.
+    if (g_bios_file[0] && g_bios_file[0] != ':' && !sd_file_exists(g_bios_file)) g_bios_file[0] = 0;
+    if (g_font_file[0] && g_font_file[0] != ':' && !sd_file_exists(g_font_file)) g_font_file[0] = 0;
+    // Same order as the BIOS: the menu's choice, then a FONT.ROM on the card,
+    // then the font built into the firmware. Last again, so a card that has one
+    // keeps using it.
+    milstr_ncpy(np2cfg.fontfile,
+                g_font_file[0]              ? g_font_file
+              : sd_file_exists("/FONT.ROM") ? "/FONT.ROM"
+                                            : ":builtin/FONT.ROM",
                 sizeof(np2cfg.fontfile));
     printf("font file: %s\n", np2cfg.fontfile);
     // np2cfg.usebios (real /bios.rom vs np2's built-in emulated BIOS) is decided

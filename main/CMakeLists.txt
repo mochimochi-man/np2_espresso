@@ -1,7 +1,11 @@
 idf_component_register(
-    SRCS "main.cpp" "dosio_sd.cpp" "platform_stubs.cpp" "lcd_st7789.cpp" "usb_kbd.cpp" "audio_i2s.cpp" "menu_disk.cpp" "bt_hid.cpp" "usb_msc.cpp"
+    SRCS "main.cpp" "dosio_sd.cpp" "platform_stubs.cpp" "lcd_st7789.cpp" "usb_kbd.cpp" "audio_i2s.cpp" "menu_disk.cpp" "bt_hid.cpp"
     INCLUDE_DIRS "."
-    REQUIRES np2kai esp_lcd esp_driver_spi espressif__arduino-esp32 fatfs sdmmc usb espressif__usb_host_hid esp_driver_i2s driver nvs_flash bt esp_hid espressif__tinyusb
+    # A compatible BIOS and font linked into the image, so a board with a blank
+    # card still boots. dosio_sd.cpp serves them as ":builtin/BIOS.ROM" and
+    # ":builtin/FONT.ROM"; a real ROM on the card still wins.
+    EMBED_FILES "rom/BIOS_ESP.ROM" "rom/FONT_ESP.ROM"
+    REQUIRES np2kai esp_lcd esp_driver_spi espressif__arduino-esp32 fatfs sdmmc usb espressif__usb_host_hid esp_driver_i2s driver nvs_flash bt esp_hid
 )
 
 # Platform files include the np2kai core headers, so they need the SAME target
