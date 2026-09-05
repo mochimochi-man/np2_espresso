@@ -389,7 +389,13 @@ static void emu_task(void *arg) {
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
     pccore_init();
     pccore_reset();
-    printf("BIOS ROM: %s\n", (pccore.rom & PCROM_BIOS) ? "loaded from SD" : "emulated (dummy BASIC)");
+    // Which file was taken is on the "biosrom:" line from bios.c. This says only
+    // whether a real ROM image is in memory at all, as against np2's own
+    // emulated dummy BASIC - naming a place here read as though the card had
+    // been used, which since the built-in ROM exists is often the opposite of
+    // what happened.
+    printf("BIOS ROM: %s\n", (pccore.rom & PCROM_BIOS) ? "real ROM image in memory"
+                                                       : "emulated (dummy BASIC)");
 
     // --- mount floppies (after pccore_reset). Load NOW (setup context) via
     //     readyfddex instead of the delayed setfdd: the delayed load runs inside
